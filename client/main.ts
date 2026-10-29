@@ -41,6 +41,7 @@ const REACTION_PRESETS = [
 const root = app;
 
 bindVisualViewport();
+bindReactionDismiss();
 void boot();
 
 function bindVisualViewport(): void {
@@ -421,8 +422,10 @@ function paintThread(): void {
     const read = message.senderId === me?.id && conversation.peerLastReadSeq >= message.seq && !message.pending;
     bubble.dataset.messageId = message.id;
     bubble.append(el("small", "", read ? `${caption} · Read` : caption));
-    bubble.append(reactionChips(message));
-    if (!message.pending && !message.failed) bubble.append(reactionPicker(message));
+    if (!message.pending && !message.failed) {
+      bubble.append(reactionDock(message));
+      bindLongPress(bubble, message.id);
+    }
     scroller.append(bubble);
   }
   const transcript = el("div", "transcript");
@@ -676,6 +679,17 @@ function reactionName(emoji: string): string {
   return REACTION_PRESETS.find((preset) => preset.emoji === emoji)?.label ?? emoji;
 }
 
+function myReaction(message: LocalMessage): string | null {
+  return message.reactions.find((group) => me && group.userIds.includes(me.id))?.emoji ?? null;
+}
+
+function reactionDock(message: LocalMessage): HTMLElement {
+  const open = openReactionId === message.id;
+  const dock = el("div", "reaction-dock");
+  dock.append(reactionChips(message), reactionToggle(message, open), reactionBar(message, open));
+  return dock;
+}
+
 function reactionChips(message: LocalMessage): HTMLElement {
   const row = el("div", "reaction-row");
   row.hidden = message.reactions.length === 0;
@@ -688,7 +702,8 @@ function reactionChips(message: LocalMessage): HTMLElement {
     button.append(document.createTextNode(group.emoji));
     if (count > 1) button.append(el("span", "count", String(count)));
     button.setAttribute("aria-label", mine ? `Remove your ${name} reaction` : `React with ${name}`);
-    button.addEventListener("click", () => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
       const current = messages.find((item) => item.id === message.id);
       const selected = current?.reactions.some((item) => item.emoji === group.emoji && me && item.userIds.includes(me.id));
       void putReaction(message.id, selected ? null : group.emoji);
@@ -698,49 +713,105 @@ function reactionChips(message: LocalMessage): HTMLElement {
   return row;
 }
 
-function reactionPicker(message: LocalMessage): HTMLElement {
-  const wrap = el("div", "react");
-  const toggle = el("button", "react-toggle", "React") as HTMLButtonElement;
+function reactionToggle(message: LocalMessage, open: boolean): HTMLButtonElement {
+  const toggle = el("button", "react-toggle") as HTMLButtonElement;
   toggle.type = "button";
   toggle.setAttribute("aria-label", "Add reaction");
+  toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  const icon = iconSvg("M12 5v14M5 12h14");
+  icon.setAttribute("width", "14");
+  icon.setAttribute("height", "14");
+  toggle.append(icon);
+  toggle.addEventListener("click", (event) => {
+    event.stopPropagation();
+    setReactionBar(message.id);
+  });
+  return toggle;
+}
+
+function reactionBar(message: LocalMessage, open: boolean): HTMLElement {
   const bar = el("div", "react-bar");
+  bar.hidden = !open;
+  const selected = myReaction(message);
   for (const preset of REACTION_PRESETS) {
     const button = el("button", "", preset.emoji) as HTMLButtonElement;
     button.type = "button";
     button.dataset.emoji = preset.emoji;
     button.setAttribute("aria-label", `React with ${preset.label}`);
-    button.addEventListener("click", () => {
+    button.setAttribute("aria-pressed", selected === preset.emoji ? "true" : "false");
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
       const current = messages.find((item) => item.id === message.id);
-      const selected = current?.reactions.some((item) => item.emoji === preset.emoji && me && item.userIds.includes(me.id));
-      void putReaction(message.id, selected ? null : preset.emoji);
+      const already = current ? myReaction(current) === preset.emoji : false;
+      void putReaction(message.id, already ? null : preset.emoji);
     });
     bar.append(button);
   }
-  toggle.addEventListener("click", () => setReactionBar(message.id));
-  wrap.append(toggle, bar);
-  syncReactionBar(message, toggle, bar);
-  return wrap;
+  return bar;
 }
 
-function setReactionBar(messageId: string): void {
-  openReactionId = openReactionId === messageId ? null : messageId;
+function setReactionBar(messageId: string, forceOpen = false): void {
+  openReactionId = !forceOpen && openReactionId === messageId ? null : messageId;
+  syncReactionDocks();
+}
+
+function syncReactionDocks(): void {
   for (const bubble of document.querySelectorAll<HTMLElement>("#thread .bubble")) {
-    const toggle = bubble.querySelector<HTMLButtonElement>(".react-toggle");
-    const bar = bubble.querySelector<HTMLElement>(".react-bar");
-    if (!toggle || !bar) continue;
     const message = messages.find((item) => item.id === bubble.dataset.messageId);
-    if (message) syncReactionBar(message, toggle, bar);
+    if (!message) continue;
+    bubble.classList.toggle("reacting", openReactionId === message.id);
+    bubble.querySelector(".reaction-dock")?.replaceWith(reactionDock(message));
   }
 }
 
-function syncReactionBar(message: LocalMessage, toggle: HTMLButtonElement, bar: HTMLElement): void {
-  const open = openReactionId === message.id;
-  bar.hidden = !open;
-  toggle.setAttribute("aria-expanded", open ? "true" : "false");
-  const mine = message.reactions.find((group) => me && group.userIds.includes(me.id))?.emoji ?? null;
-  for (const button of bar.querySelectorAll<HTMLButtonElement>("button")) {
-    button.setAttribute("aria-pressed", button.dataset.emoji === mine ? "true" : "false");
-  }
+function bindLongPress(bubble: HTMLElement, messageId: string): void {
+  let timer = 0;
+  let startX = 0;
+  let startY = 0;
+  let held = false;
+  const clear = () => window.clearTimeout(timer);
+  bubble.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse") return;
+    if (!(event.target instanceof Element) || event.target.closest(".reaction-dock")) return;
+    held = false;
+    startX = event.clientX;
+    startY = event.clientY;
+    timer = window.setTimeout(() => {
+      held = true;
+      setReactionBar(messageId, true);
+    }, 450);
+  });
+  bubble.addEventListener("pointermove", (event) => {
+    if (!timer) return;
+    if (Math.hypot(event.clientX - startX, event.clientY - startY) > 10) clear();
+  });
+  bubble.addEventListener("pointerup", clear);
+  bubble.addEventListener("pointercancel", clear);
+  bubble.addEventListener("click", (event) => {
+    if (!held) return;
+    held = false;
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
+  bubble.addEventListener("contextmenu", (event) => {
+    if (window.matchMedia("(hover: hover) and (pointer: fine)").matches) return;
+    event.preventDefault();
+  });
+}
+
+function bindReactionDismiss(): void {
+  document.addEventListener("pointerdown", (event) => {
+    if (!openReactionId || !(event.target instanceof Node)) return;
+    const bubble = document.querySelector(`#thread .bubble[data-message-id="${CSS.escape(openReactionId)}"]`);
+    if (bubble?.contains(event.target)) return;
+    openReactionId = null;
+    syncReactionDocks();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !openReactionId) return;
+    openReactionId = null;
+    syncReactionDocks();
+  });
 }
 
 function putReaction(messageId: string, emoji: string | null): void {
@@ -794,10 +865,8 @@ function applyReactionEvent(messageId: string, userId: string, emoji: string | n
 function refreshReactionControls(message: LocalMessage): void {
   const bubble = document.querySelector<HTMLElement>(`#thread .bubble[data-message-id="${CSS.escape(message.id)}"]`);
   if (!bubble) return;
-  bubble.querySelector(".reaction-row")?.replaceWith(reactionChips(message));
-  const toggle = bubble.querySelector<HTMLButtonElement>(".react-toggle");
-  const bar = bubble.querySelector<HTMLElement>(".react-bar");
-  if (toggle && bar) syncReactionBar(message, toggle, bar);
+  bubble.classList.toggle("reacting", openReactionId === message.id);
+  bubble.querySelector(".reaction-dock")?.replaceWith(reactionDock(message));
 }
 
 function showBanner(message: string): void {
