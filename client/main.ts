@@ -268,23 +268,28 @@ function paintList(): void {
   paintTitle();
   const list = document.querySelector("#conversation-list");
   if (!list) return;
-  list.replaceChildren();
-  if (conversations.length === 0) {
-    list.append(el("p", "empty", "Find someone by their exact username."));
-    return;
-  }
-  for (const conversation of conversations) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "conversation";
-    button.setAttribute("aria-current", conversation.id === activeId ? "true" : "false");
-    const name = el("strong", "", conversation.peer.displayName);
-    const meta = el("span", "meta", `@${conversation.peer.username}`);
-    const preview = el("span", "preview", conversation.lastMessagePreview ?? "No messages yet");
-    button.append(name, meta, preview);
-    if (conversation.unreadCount > 0) button.append(el("span", "unread", String(conversation.unreadCount)));
-    button.addEventListener("click", () => void openConversation(conversation.id));
-    list.append(button);
+  const caret = captureComposerCaret();
+  try {
+    list.replaceChildren();
+    if (conversations.length === 0) {
+      list.append(el("p", "empty", "Find someone by their exact username."));
+      return;
+    }
+    for (const conversation of conversations) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "conversation";
+      button.setAttribute("aria-current", conversation.id === activeId ? "true" : "false");
+      const name = el("strong", "", conversation.peer.displayName);
+      const meta = el("span", "meta", `@${conversation.peer.username}`);
+      const preview = el("span", "preview", conversation.lastMessagePreview ?? "No messages yet");
+      button.append(name, meta, preview);
+      if (conversation.unreadCount > 0) button.append(el("span", "unread", String(conversation.unreadCount)));
+      button.addEventListener("click", () => void openConversation(conversation.id));
+      list.append(button);
+    }
+  } finally {
+    restoreComposerCaret(caret);
   }
 }
 
@@ -296,10 +301,11 @@ function paintTitle(): void {
 function paintThread(): void {
   const thread = document.querySelector("#thread");
   if (!thread) return;
-  thread.replaceChildren();
+  const caret = captureComposerCaret();
   const conversation = conversations.find((item) => item.id === activeId);
   if (!conversation) {
-    thread.append(el("p", "empty", "Choose a conversation or start a new one."));
+    thread.replaceChildren(el("p", "empty", "Choose a conversation or start a new one."));
+    thread.removeAttribute("data-conversation-id");
     return;
   }
   const head = el("div", "thread-head");
@@ -367,6 +373,25 @@ function paintThread(): void {
     figure.append(remove);
     draftsRow.append(figure);
   }
+  const parked = thread.querySelector("form.composer");
+  let form: HTMLFormElement;
+  if (parked instanceof HTMLFormElement && thread.getAttribute("data-conversation-id") === conversation.id) {
+    const box = parked.querySelector("textarea");
+    if (box instanceof HTMLTextAreaElement && box.value !== draftText) box.value = draftText;
+    form = parked;
+  } else {
+    form = buildComposer();
+  }
+  for (const child of [...thread.children]) {
+    if (child !== form) child.remove();
+  }
+  thread.setAttribute("data-conversation-id", conversation.id);
+  thread.append(head, older, scroller, typing, draftsRow, form);
+  scroller.scrollTop = scroller.scrollHeight;
+  restoreComposerCaret(caret);
+}
+
+function buildComposer(): HTMLFormElement {
   const form = document.createElement("form");
   form.className = "composer";
   const box = document.createElement("textarea");
@@ -418,8 +443,7 @@ function paintThread(): void {
     sendTyping(false);
     await sendMessage(body, pending.map((draft) => draft.file), pending.map((draft) => draft.url));
   });
-  thread.append(head, older, scroller, typing, draftsRow, form);
-  scroller.scrollTop = scroller.scrollHeight;
+  return form;
 }
 
 async function refresh(): Promise<void> {
@@ -736,9 +760,14 @@ function handleEvent(event: HubEvent): void {
   }
   if (event.type === "typing" && event.conversationId === activeId && event.userId !== me?.id) {
     peerTyping = event.active;
+    const caret = captureComposerCaret();
     const node = document.querySelector(".typing");
     const conversation = conversations.find((item) => item.id === activeId);
-    if (node && conversation) node.textContent = event.active ? `${conversation.peer.displayName} is typing` : "";
+    if (node && conversation) {
+      const next = event.active ? `${conversation.peer.displayName} is typing` : "";
+      if (node.textContent !== next) node.textContent = next;
+    }
+    restoreComposerCaret(caret);
     return;
   }
   if (event.type === "presence") {
@@ -823,4 +852,31 @@ function el(tag: string, className = "", text = ""): HTMLElement {
 
 function formatTime(timestamp: number): string {
   return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(timestamp);
+}
+
+type ComposerCaret = {
+  box: HTMLTextAreaElement;
+  start: number;
+  end: number;
+  value: string;
+};
+
+function captureComposerCaret(): ComposerCaret | null {
+  const box = document.querySelector("#thread textarea");
+  if (!(box instanceof HTMLTextAreaElement) || document.activeElement !== box) return null;
+  return { box, start: box.selectionStart, end: box.selectionEnd, value: box.value };
+}
+
+function restoreComposerCaret(caret: ComposerCaret | null): void {
+  applyComposerCaret(caret);
+  queueMicrotask(() => applyComposerCaret(caret));
+}
+
+function applyComposerCaret(caret: ComposerCaret | null): void {
+  if (!caret?.box.isConnected) return;
+  if (document.activeElement !== caret.box) caret.box.focus({ preventScroll: true });
+  if (caret.box.value !== caret.value) return;
+  if (caret.box.selectionStart !== caret.start || caret.box.selectionEnd !== caret.end) {
+    caret.box.setSelectionRange(caret.start, caret.end);
+  }
 }

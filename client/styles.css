@@ -209,7 +209,7 @@ body:has(.viewer) { overflow: hidden; }
 .composer textarea { flex: 1; }
 .empty { margin: auto; color: var(--muted); text-align: center; padding: 24px; }
 .presence { color: var(--accent); font-family: "Avenir Next", "Segoe UI", sans-serif; font-size: 0.85rem; }
-.typing { min-height: 1.2rem; padding: 0 18px 8px; color: var(--muted); font-family: "Avenir Next", "Segoe UI", sans-serif; }
+.typing { height: 1.2rem; line-height: 1.2rem; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; padding: 0 18px 8px; color: var(--muted); font-family: "Avenir Next", "Segoe UI", sans-serif; }
 .dev-link { word-break: break-all; }
 
 @media (max-width: 760px) {
