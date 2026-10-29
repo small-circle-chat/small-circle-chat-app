@@ -28,7 +28,61 @@ let viewerSrc: string | null = null;
 
 const root = app;
 
+bindVisualViewport();
 void boot();
+
+function bindVisualViewport(): void {
+  const viewport = window.visualViewport;
+  const smallViewport = measureViewportUnit("100svh");
+  let baselineHeight: number | null = null;
+  let trustReportedHeight = false;
+  let appliedHeight = -1;
+  let appliedTop = -1;
+  let pinFrame = 0;
+  const sync = () => {
+    const reported = Math.round(viewport?.height ?? window.innerHeight);
+    const offsetTop = Math.round(viewport?.offsetTop ?? 0);
+    if (baselineHeight === null) baselineHeight = reported;
+    if (reported !== baselineHeight || offsetTop !== 0) trustReportedHeight = true;
+    // On first load Safari can report the tall layout viewport while its URL
+    // bar and bottom toolbar are still covering the page. Stay within the
+    // small viewport until the visual viewport actually moves.
+    const height = !trustReportedHeight && smallViewport > 0 ? Math.min(reported, smallViewport) : reported;
+    if (height <= 0 || (height === appliedHeight && offsetTop === appliedTop)) return;
+    const scroller = document.querySelector<HTMLElement>("#thread .messages");
+    const pinned = scroller !== null && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48;
+    document.documentElement.style.setProperty("--vvh", `${height}px`);
+    document.documentElement.style.setProperty("--vv-top", `${offsetTop}px`);
+    appliedHeight = height;
+    appliedTop = offsetTop;
+    if (!pinned || !scroller) return;
+    cancelAnimationFrame(pinFrame);
+    pinFrame = requestAnimationFrame(() => {
+      scroller.scrollTop = scroller.scrollHeight;
+    });
+  };
+  sync();
+  viewport?.addEventListener("resize", sync);
+  viewport?.addEventListener("scroll", sync);
+  window.addEventListener("orientationchange", () => {
+    sync();
+    window.setTimeout(sync, 250);
+  });
+}
+
+function measureViewportUnit(height: string): number {
+  const probe = document.createElement("div");
+  probe.style.position = "fixed";
+  probe.style.top = "0";
+  probe.style.height = height;
+  probe.style.width = "0";
+  probe.style.pointerEvents = "none";
+  probe.style.visibility = "hidden";
+  document.documentElement.append(probe);
+  const measured = Math.round(probe.getBoundingClientRect().height);
+  probe.remove();
+  return measured;
+}
 
 async function boot(): Promise<void> {
   const params = new URLSearchParams(location.search);
