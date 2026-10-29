@@ -1,0 +1,25 @@
+{
+  "name": "messaging-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "CI=true wrangler d1 migrations apply messaging-app --local && vite",
+    "build": "vite build",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.client.json",
+    "types": "wrangler types",
+    "db:migrate:local": "wrangler d1 migrations apply messaging-app --local",
+    "db:migrate:remote": "wrangler d1 migrations apply messaging-app --remote"
+  },
+  "dependencies": {
+    "hono": "^4.10.7"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^1.15.3",
+    "@cloudflare/vitest-pool-workers": "^0.12.21",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.12",
+    "vitest": "^3.2.4",
+    "wrangler": "^4.45.0"
+  }
+}

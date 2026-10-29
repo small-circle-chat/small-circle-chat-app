@@ -1,0 +1,7 @@
+# Copy this file to .dev.vars. That file is gitignored and is only read by local dev.
+# Leave the key empty to print magic links on localhost.
+#
+# Production does not read .dev.vars. After the Worker exists, add the same name
+# as a Secret under Workers & Pages → messaging-app → Settings → Variables and Secrets.
+# Do not put this key in wrangler.jsonc or in Cloudflare's account API Tokens page.
+MAILCHANNELS_API_KEY=

@@ -1,0 +1,84 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "messaging-app",
+  "main": "src/index.ts",
+  "workers_dev": false,
+  "routes": [
+    {
+      "pattern": "smallcirclechat.app",
+      "custom_domain": true
+    }
+  ],
+  "compatibility_date": "2026-10-28",
+  "observability": {
+    "enabled": true,
+    "traces": {
+      "enabled": true
+    }
+  },
+  "assets": {
+    // The Vite plugin replaces this with dist/client on build. The directory
+    // is required by the Vitest Workers pool, which still uses an older Wrangler.
+    "directory": "./public",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "r2_buckets": [
+    {
+      "binding": "MEDIA",
+      "bucket_name": "messaging-app-media"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "messaging-app",
+      "database_id": "2304cf32-ea40-4e16-9d08-a482a95076b0",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "USER_HUB",
+        "class_name": "UserHub"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["UserHub"]
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "AUTH_RATE_LIMITER",
+      "namespace_id": "1001",
+      "simple": {
+        "limit": 5,
+        "period": 60
+      }
+    },
+    {
+      "name": "SEND_RATE_LIMITER",
+      "namespace_id": "1002",
+      "simple": {
+        "limit": 30,
+        "period": 60
+      }
+    },
+    {
+      "name": "LOOKUP_RATE_LIMITER",
+      "namespace_id": "1003",
+      "simple": {
+        "limit": 30,
+        "period": 60
+      }
+    }
+  ],
+  "vars": {
+    "MAIL_FROM": "noreply@smallcirclechat.app",
+    "MAIL_FROM_NAME": "Small Circle Chat"
+  }
+}
