@@ -1,4 +1,4 @@
-import type { ApiError, ConversationDto, HubEvent, MessageDto, MessagePage, PublicUser } from "../shared/events";
+import type { ApiError, ConversationDto, HubEvent, MessageDto, MessagePage, PublicUser, ReactionGroup } from "../shared/events";
 
 const app = document.querySelector<HTMLElement>("#app");
 if (!app) throw new Error("Missing #app");
@@ -26,6 +26,17 @@ let devLink = "";
 let draftText = "";
 let drafts: Array<{ file: File; url: string }> = [];
 let viewerSrc: string | null = null;
+let openReactionId: string | null = null;
+const reactionTails = new Map<string, Promise<void>>();
+
+const REACTION_PRESETS = [
+  { emoji: "\u2764\uFE0F", label: "heart" },
+  { emoji: "\u{1F44D}", label: "thumbs up" },
+  { emoji: "\u{1F44E}", label: "thumbs down" },
+  { emoji: "\u{1F602}", label: "face with tears of joy" },
+  { emoji: "\u203C\uFE0F", label: "double exclamation" },
+  { emoji: "\u2753", label: "question" },
+] as const;
 
 const root = app;
 
@@ -369,6 +380,7 @@ function paintThread(): void {
   back.type = "button";
   back.addEventListener("click", () => {
     activeId = null;
+    openReactionId = null;
     closeViewer();
     document.querySelector(".shell")?.classList.remove("thread-open");
     paintList();
@@ -407,7 +419,10 @@ function paintThread(): void {
     if (message.body) bubble.append(document.createTextNode(message.body));
     const caption = message.failed ? "Not sent. Retry from the composer." : message.pending ? "Sending…" : formatTime(message.createdAt);
     const read = message.senderId === me?.id && conversation.peerLastReadSeq >= message.seq && !message.pending;
+    bubble.dataset.messageId = message.id;
     bubble.append(el("small", "", read ? `${caption} · Read` : caption));
+    bubble.append(reactionChips(message));
+    if (!message.pending && !message.failed) bubble.append(reactionPicker(message));
     scroller.append(bubble);
   }
   const transcript = el("div", "transcript");
@@ -524,6 +539,7 @@ async function refresh(): Promise<void> {
 
 async function openConversation(id: string): Promise<void> {
   activeId = id;
+  openReactionId = null;
   peerTyping = false;
   banner = "";
   closeViewer();
@@ -656,6 +672,153 @@ function iconSvg(path: string): SVGSVGElement {
   return svg;
 }
 
+function reactionName(emoji: string): string {
+  return REACTION_PRESETS.find((preset) => preset.emoji === emoji)?.label ?? emoji;
+}
+
+function reactionChips(message: LocalMessage): HTMLElement {
+  const row = el("div", "reaction-row");
+  row.hidden = message.reactions.length === 0;
+  for (const group of message.reactions) {
+    const mine = Boolean(me && group.userIds.includes(me.id));
+    const button = el("button", mine ? "chip mine" : "chip") as HTMLButtonElement;
+    button.type = "button";
+    const count = group.userIds.length;
+    const name = reactionName(group.emoji);
+    button.append(document.createTextNode(group.emoji));
+    if (count > 1) button.append(el("span", "count", String(count)));
+    button.setAttribute("aria-label", mine ? `Remove your ${name} reaction` : `React with ${name}`);
+    button.addEventListener("click", () => {
+      const current = messages.find((item) => item.id === message.id);
+      const selected = current?.reactions.some((item) => item.emoji === group.emoji && me && item.userIds.includes(me.id));
+      void putReaction(message.id, selected ? null : group.emoji);
+    });
+    row.append(button);
+  }
+  return row;
+}
+
+function reactionPicker(message: LocalMessage): HTMLElement {
+  const wrap = el("div", "react");
+  const toggle = el("button", "react-toggle", "React") as HTMLButtonElement;
+  toggle.type = "button";
+  toggle.setAttribute("aria-label", "Add reaction");
+  const bar = el("div", "react-bar");
+  for (const preset of REACTION_PRESETS) {
+    const button = el("button", "", preset.emoji) as HTMLButtonElement;
+    button.type = "button";
+    button.dataset.emoji = preset.emoji;
+    button.setAttribute("aria-label", `React with ${preset.label}`);
+    button.addEventListener("click", () => {
+      const current = messages.find((item) => item.id === message.id);
+      const selected = current?.reactions.some((item) => item.emoji === preset.emoji && me && item.userIds.includes(me.id));
+      void putReaction(message.id, selected ? null : preset.emoji);
+    });
+    bar.append(button);
+  }
+  toggle.addEventListener("click", () => setReactionBar(message.id));
+  wrap.append(toggle, bar);
+  syncReactionBar(message, toggle, bar);
+  return wrap;
+}
+
+function setReactionBar(messageId: string): void {
+  openReactionId = openReactionId === messageId ? null : messageId;
+  for (const bubble of document.querySelectorAll<HTMLElement>("#thread .bubble")) {
+    const toggle = bubble.querySelector<HTMLButtonElement>(".react-toggle");
+    const bar = bubble.querySelector<HTMLElement>(".react-bar");
+    if (!toggle || !bar) continue;
+    const message = messages.find((item) => item.id === bubble.dataset.messageId);
+    if (message) syncReactionBar(message, toggle, bar);
+  }
+}
+
+function syncReactionBar(message: LocalMessage, toggle: HTMLButtonElement, bar: HTMLElement): void {
+  const open = openReactionId === message.id;
+  bar.hidden = !open;
+  toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  const mine = message.reactions.find((group) => me && group.userIds.includes(me.id))?.emoji ?? null;
+  for (const button of bar.querySelectorAll<HTMLButtonElement>("button")) {
+    button.setAttribute("aria-pressed", button.dataset.emoji === mine ? "true" : "false");
+  }
+}
+
+function putReaction(messageId: string, emoji: string | null): void {
+  const previous = reactionTails.get(messageId) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(() => sendReaction(messageId, emoji));
+  reactionTails.set(messageId, next);
+}
+
+async function sendReaction(messageId: string, emoji: string | null): Promise<void> {
+  const message = messages.find((item) => item.id === messageId);
+  if (!activeId || !message || message.pending || message.failed) return;
+  const conversationId = activeId;
+  const result = await api<{ reactions: ReactionGroup[] }>(
+    `/api/conversations/${conversationId}/messages/${messageId}/reaction`,
+    { method: "PUT", body: { emoji } },
+  );
+  if (activeId !== conversationId) return;
+  if (!result.ok) {
+    showBanner(result.message);
+    return;
+  }
+  clearBanner();
+  openReactionId = null;
+  applyReactionGroups(messageId, result.data.reactions);
+}
+
+function applyReactionGroups(messageId: string, reactions: ReactionGroup[]): void {
+  const message = messages.find((item) => item.id === messageId);
+  if (!message) return;
+  message.reactions = reactions;
+  refreshReactionControls(message);
+}
+
+function applyReactionEvent(messageId: string, userId: string, emoji: string | null): void {
+  const message = messages.find((item) => item.id === messageId);
+  if (!message) return;
+  const current = message.reactions.find((group) => group.userIds.includes(userId));
+  if ((current?.emoji ?? null) === emoji) return;
+  const reactions = message.reactions
+    .map((group) => ({ emoji: group.emoji, userIds: group.userIds.filter((id) => id !== userId) }))
+    .filter((group) => group.userIds.length > 0);
+  if (emoji) {
+    const existing = reactions.find((group) => group.emoji === emoji);
+    if (existing) existing.userIds.push(userId);
+    else reactions.push({ emoji, userIds: [userId] });
+  }
+  message.reactions = reactions;
+  refreshReactionControls(message);
+}
+
+function refreshReactionControls(message: LocalMessage): void {
+  const bubble = document.querySelector<HTMLElement>(`#thread .bubble[data-message-id="${CSS.escape(message.id)}"]`);
+  if (!bubble) return;
+  bubble.querySelector(".reaction-row")?.replaceWith(reactionChips(message));
+  const toggle = bubble.querySelector<HTMLButtonElement>(".react-toggle");
+  const bar = bubble.querySelector<HTMLElement>(".react-bar");
+  if (toggle && bar) syncReactionBar(message, toggle, bar);
+}
+
+function showBanner(message: string): void {
+  banner = message;
+  const scroller = document.querySelector("#thread .messages");
+  if (!scroller) return;
+  let node = scroller.querySelector<HTMLElement>(":scope > .banner");
+  if (!node) {
+    node = el("p", "banner", message);
+    scroller.prepend(node);
+    return;
+  }
+  node.hidden = false;
+  node.textContent = message;
+}
+
+function clearBanner(): void {
+  banner = "";
+  document.querySelector("#thread .messages > .banner")?.remove();
+}
+
 function markFailed(clientMsgId: string): void {
   const failed = messages.find((message) => message.clientMsgId === clientMsgId);
   if (failed) {
@@ -705,6 +868,7 @@ async function sendMessage(body: string, files: File[], previews: string[]): Pro
     body,
     createdAt: Date.now(),
     attachments: [],
+    reactions: [],
     localPreviews: previews,
     pending: true,
   };
@@ -840,6 +1004,10 @@ function handleEvent(event: HubEvent): void {
       if (conversation.peer.id === event.userId) conversation.peerOnline = event.online;
     }
     paintThread();
+    return;
+  }
+  if (event.type === "reaction" && event.conversationId === activeId) {
+    applyReactionEvent(event.messageId, event.userId, event.emoji);
   }
 }
 

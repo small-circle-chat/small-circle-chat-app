@@ -191,6 +191,34 @@ textarea { resize: vertical; min-height: 44px; }
 .bubble.pending { opacity: 0.7; }
 .bubble.failed { border-color: var(--danger); }
 .bubble small { display: block; margin-top: 4px; color: var(--muted); font-family: "Avenir Next", "Segoe UI", sans-serif; }
+.reaction-row, .react { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; max-width: 100%; margin-top: 6px; }
+.reaction-row[hidden] { display: none; }
+.bubble.mine .reaction-row, .bubble.mine .react { justify-content: flex-end; }
+.chip, .react-bar button {
+  font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+}
+.chip, .react-toggle, .react-bar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-height: 28px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #fff;
+}
+.chip { padding: 2px 8px; font-size: 0.95rem; }
+.chip.mine, .react-bar button[aria-pressed="true"] { border-color: var(--accent); }
+.chip .count { font-family: "Avenir Next", "Segoe UI", sans-serif; font-size: 0.75rem; color: var(--muted); }
+.react-toggle {
+  padding: 2px 8px;
+  color: var(--muted);
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+  font-size: 0.75rem;
+}
+.react-bar { display: flex; flex-wrap: wrap; gap: 4px; }
+.react-bar[hidden] { display: none; }
+.react-bar button { min-width: 32px; padding: 0 6px; font-size: 1rem; }
 .attachment { display: block; max-width: 100%; max-height: 240px; border-radius: 12px; margin-bottom: 6px; }
 .attachment-button {
   display: block;
@@ -273,4 +301,6 @@ body:has(.viewer) { overflow: hidden; }
   .shell.thread-open .sidebar { display: none; }
   .shell:not(.thread-open) .thread { display: none; }
   .preview { max-width: 70vw; }
+  .bubble { max-width: min(88%, 520px); }
+  .chip, .react-toggle, .react-bar button { min-height: 36px; }
 }

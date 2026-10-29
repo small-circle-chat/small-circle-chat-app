@@ -18,6 +18,11 @@ export type AttachmentDto = {
   byteSize: number;
 };
 
+export type ReactionGroup = {
+  emoji: string;
+  userIds: string[];
+};
+
 export type MessageDto = {
   id: string;
   conversationId: string;
@@ -27,6 +32,7 @@ export type MessageDto = {
   body: string;
   createdAt: number;
   attachments: AttachmentDto[];
+  reactions: ReactionGroup[];
 };
 
 export type MessagePage = {
@@ -50,7 +56,8 @@ export type HubEvent =
   | { type: "message"; conversationId: string; message: MessageDto }
   | { type: "read"; conversationId: string; userId: string; lastReadSeq: number }
   | { type: "typing"; conversationId: string; userId: string; active: boolean }
-  | { type: "presence"; userId: string; online: boolean };
+  | { type: "presence"; userId: string; online: boolean }
+  | { type: "reaction"; conversationId: string; messageId: string; userId: string; emoji: string | null };
 
 export type ApiError = {
   error: {

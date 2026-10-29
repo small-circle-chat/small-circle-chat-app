@@ -1,6 +1,7 @@
 import type { MessageDto, MessagePage } from "../shared/events";
 import { attachmentsForMessages } from "./attachments";
 import { MESSAGE_PAGE_SIZE, memberIds, toMessage, type MessageRow } from "./db";
+import { reactionsForMessages } from "./reactions";
 import { fanOut } from "./user-hub";
 
 export async function insertMessage(
@@ -11,10 +12,7 @@ export async function insertMessage(
     .prepare(`SELECT * FROM messages WHERE conversation_id = ? AND client_msg_id = ?`)
     .bind(input.conversationId, input.clientMsgId)
     .first<MessageRow>();
-  if (existing) {
-    const grouped = await attachmentsForMessages(db, [existing.id]);
-    return { message: toMessage(existing, grouped.get(existing.id) ?? []), replay: true };
-  }
+  if (existing) return { message: await hydrateMessage(db, existing), replay: true };
 
   const id = crypto.randomUUID();
   const createdAt = Date.now();
@@ -40,10 +38,7 @@ export async function insertMessage(
           .prepare(`SELECT * FROM messages WHERE conversation_id = ? AND client_msg_id = ?`)
           .bind(input.conversationId, input.clientMsgId)
           .first<MessageRow>();
-        if (raced) {
-          const grouped = await attachmentsForMessages(db, [raced.id]);
-          return { message: toMessage(raced, grouped.get(raced.id) ?? []), replay: true };
-        }
+        if (raced) return { message: await hydrateMessage(db, raced), replay: true };
       }
       if (!message.includes("messages.seq") || attempt === 1) throw error;
     }
@@ -95,12 +90,16 @@ function takePage(rows: MessageRow[]): { rows: MessageRow[]; hasMore: boolean } 
   return { rows: rows.slice(0, MESSAGE_PAGE_SIZE), hasMore: true };
 }
 
+async function hydrateMessage(db: D1Database, row: MessageRow): Promise<MessageDto> {
+  const [messages] = await withAttachments(db, [row]);
+  if (!messages) throw new Error("Message could not be read");
+  return messages;
+}
+
 async function withAttachments(db: D1Database, rows: MessageRow[]): Promise<MessageDto[]> {
-  const grouped = await attachmentsForMessages(
-    db,
-    rows.map((row) => row.id),
-  );
-  return rows.map((row) => toMessage(row, grouped.get(row.id) ?? []));
+  const ids = rows.map((row) => row.id);
+  const [grouped, reactions] = await Promise.all([attachmentsForMessages(db, ids), reactionsForMessages(db, ids)]);
+  return rows.map((row) => toMessage(row, grouped.get(row.id) ?? [], reactions.get(row.id) ?? []));
 }
 
 export async function markRead(

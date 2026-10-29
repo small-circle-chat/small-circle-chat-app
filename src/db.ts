@@ -1,4 +1,4 @@
-import type { AttachmentDto, MessageDto, Peer, PublicUser } from "../shared/events";
+import type { AttachmentDto, MessageDto, Peer, PublicUser, ReactionGroup } from "../shared/events";
 
 export const SESSION_COOKIE = "__Host-session";
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -46,7 +46,11 @@ export function toPublicUser(user: UserRow): PublicUser {
   };
 }
 
-export function toMessage(row: MessageRow, attachments: AttachmentDto[] = []): MessageDto {
+export function toMessage(
+  row: MessageRow,
+  attachments: AttachmentDto[] = [],
+  reactions: ReactionGroup[] = [],
+): MessageDto {
   return {
     id: row.id,
     conversationId: row.conversation_id,
@@ -56,6 +60,7 @@ export function toMessage(row: MessageRow, attachments: AttachmentDto[] = []): M
     body: row.body,
     createdAt: row.created_at,
     attachments,
+    reactions,
   };
 }
 
