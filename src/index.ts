@@ -387,11 +387,11 @@ app.get("/api/conversations/:id/messages", async (c) => {
     return error(c, 400, "invalid_input", "Sequence cursors must be positive integers.");
   }
   if (before && after) return error(c, 400, "invalid_input", "Choose one sequence cursor.");
-  const messages = await listMessages(c.env.DB, conversation.id, {
+  const page = await listMessages(c.env.DB, conversation.id, {
     beforeSeq: before ?? undefined,
     afterSeq: after ?? undefined,
   });
-  return c.json({ messages });
+  return c.json(page);
 });
 
 app.post("/api/conversations/:id/attachments", async (c) => {

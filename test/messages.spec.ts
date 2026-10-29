@@ -45,9 +45,10 @@ describe("direct messages", () => {
     expect(forbidden.status).toBe(404);
 
     const history = await send(alan.cookie, `/api/conversations/${conversationId}/messages`, undefined, "GET");
-    const body = (await history.json()) as { messages: Array<{ id: string; seq: number }> };
+    const body = (await history.json()) as { messages: Array<{ id: string; seq: number }>; hasMore: boolean };
     expect(body.messages.map((message) => message.id)).toEqual([stored.id]);
     expect(body.messages[0]?.seq).toBe(stored.seq);
+    expect(body.hasMore).toBe(false);
 
     const count = await env.DB.prepare(`SELECT COUNT(*) AS count FROM messages`).first<{ count: number }>();
     expect(count?.count).toBe(1);
@@ -145,7 +146,56 @@ describe("direct messages", () => {
     expect(owner.displayName).toBe("Annabella");
     expect(released.cookie).toContain("__Host-session=");
   });
+
+  it("reports another page from one extra row, including when sequence numbers skip", async () => {
+    const ada = await register("ada@example.com", "ada", "Ada Lovelace");
+    const alan = await register("alan@example.com", "alan", "Alan Turing");
+    const opened = await send(ada.cookie, "/api/conversations", { username: "alan" });
+    const conversationId = ((await opened.json()) as { conversation: { id: string } }).conversation.id;
+    const profile = await send(ada.cookie, "/api/me", undefined, "GET");
+    const senderId = ((await profile.json()) as { user: { id: string } }).user.id;
+
+    await insertMessages(conversationId, senderId, 51);
+    const latest = await send(alan.cookie, `/api/conversations/${conversationId}/messages`, undefined, "GET");
+    const page = (await latest.json()) as { messages: Array<{ seq: number }>; hasMore: boolean };
+    expect(page.hasMore).toBe(true);
+    expect(page.messages.map((message) => message.seq)).toEqual(range(2, 51));
+
+    const older = await send(
+      alan.cookie,
+      `/api/conversations/${conversationId}/messages?before_seq=${page.messages[0]?.seq}`,
+      undefined,
+      "GET",
+    );
+    const rest = (await older.json()) as { messages: Array<{ seq: number }>; hasMore: boolean };
+    expect(rest.hasMore).toBe(false);
+    expect(rest.messages.map((message) => message.seq)).toEqual([1]);
+
+    await env.DB.prepare(`DELETE FROM messages WHERE conversation_id = ? AND seq = 1`).bind(conversationId).run();
+    const gapped = await send(alan.cookie, `/api/conversations/${conversationId}/messages`, undefined, "GET");
+    const gap = (await gapped.json()) as { messages: Array<{ seq: number }>; hasMore: boolean };
+    expect(gap.hasMore).toBe(false);
+    expect(gap.messages).toHaveLength(50);
+    expect(gap.messages[0]?.seq).toBe(2);
+  });
 });
+
+async function insertMessages(conversationId: string, senderId: string, count: number): Promise<void> {
+  const statements = [];
+  for (let seq = 1; seq <= count; seq += 1) {
+    statements.push(
+      env.DB.prepare(
+        `INSERT INTO messages (id, conversation_id, sender_id, client_msg_id, seq, body, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).bind(crypto.randomUUID(), conversationId, senderId, crypto.randomUUID(), seq, `message ${seq}`, seq),
+    );
+  }
+  await env.DB.batch(statements);
+}
+
+function range(start: number, end: number): number[] {
+  return Array.from({ length: end - start + 1 }, (_, index) => start + index);
+}
 
 const PNG = Uint8Array.from([
   0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00,

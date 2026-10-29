@@ -29,6 +29,11 @@ export type MessageDto = {
   attachments: AttachmentDto[];
 };
 
+export type MessagePage = {
+  messages: MessageDto[];
+  hasMore: boolean;
+};
+
 export type ConversationDto = {
   id: string;
   unreadCount: number;

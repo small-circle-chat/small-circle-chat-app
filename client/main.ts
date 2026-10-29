@@ -1,4 +1,4 @@
-import type { ApiError, ConversationDto, HubEvent, MessageDto, PublicUser } from "../shared/events";
+import type { ApiError, ConversationDto, HubEvent, MessageDto, MessagePage, PublicUser } from "../shared/events";
 
 const app = document.querySelector<HTMLElement>("#app");
 if (!app) throw new Error("Missing #app");
@@ -11,6 +11,7 @@ let conversations: ConversationDto[] = [];
 let activeId: string | null = null;
 let messages: LocalMessage[] = [];
 let oldestSeq: number | null = null;
+let hasOlder = false;
 let loadingOlder = false;
 let socket: WebSocket | null = null;
 let retryMs = 500;
@@ -388,10 +389,7 @@ function paintThread(): void {
     paintThread();
   });
   head.append(back, title, block);
-  const older = el("button", "ghost", loadingOlder ? "Loading…" : "Load earlier messages") as HTMLButtonElement;
-  older.type = "button";
-  older.disabled = loadingOlder || oldestSeq === null || oldestSeq <= 1;
-  older.addEventListener("click", () => void loadOlder());
+  const older = hasOlder || loadingOlder ? olderButton() : null;
   const scroller = el("div", "messages");
   if (banner) scroller.append(el("p", "banner", banner));
   if (messages.length === 0) scroller.append(el("p", "empty", "Say hello."));
@@ -442,9 +440,17 @@ function paintThread(): void {
     if (child !== form) child.remove();
   }
   thread.setAttribute("data-conversation-id", conversation.id);
-  thread.append(head, older, transcript, draftsRow, form);
+  thread.append(head, ...(older ? [older] : []), transcript, draftsRow, form);
   scroller.scrollTop = scroller.scrollHeight;
   restoreComposerCaret(caret);
+}
+
+function olderButton(): HTMLButtonElement {
+  const older = el("button", "ghost", loadingOlder ? "Loading…" : "Load earlier messages") as HTMLButtonElement;
+  older.type = "button";
+  older.disabled = loadingOlder;
+  older.addEventListener("click", () => void loadOlder());
+  return older;
 }
 
 function buildComposer(): HTMLFormElement {
@@ -524,6 +530,7 @@ async function openConversation(id: string): Promise<void> {
   resetComposer();
   document.querySelector(".shell")?.classList.add("thread-open");
   messages = [];
+  hasOlder = false;
   paintList();
   paintThread();
   await reloadActive();
@@ -533,7 +540,7 @@ async function reloadActive(): Promise<void> {
   if (!activeId) return;
   const [detail, history] = await Promise.all([
     api<{ conversation: ConversationDto }>(`/api/conversations/${activeId}`),
-    api<{ messages: MessageDto[] }>(`/api/conversations/${activeId}/messages`),
+    api<MessagePage>(`/api/conversations/${activeId}/messages`),
   ]);
   if (!detail.ok) {
     banner = detail.message;
@@ -547,6 +554,7 @@ async function reloadActive(): Promise<void> {
   }
   upsertConversation(detail.data.conversation);
   messages = history.data.messages;
+  hasOlder = history.data.hasMore;
   oldestSeq = messages[0]?.seq ?? null;
   paintList();
   paintThread();
@@ -555,10 +563,10 @@ async function reloadActive(): Promise<void> {
 }
 
 async function loadOlder(): Promise<void> {
-  if (!activeId || oldestSeq === null) return;
+  if (!activeId || oldestSeq === null || !hasOlder || loadingOlder) return;
   loadingOlder = true;
   paintThread();
-  const result = await api<{ messages: MessageDto[] }>(`/api/conversations/${activeId}/messages?before_seq=${oldestSeq}`);
+  const result = await api<MessagePage>(`/api/conversations/${activeId}/messages?before_seq=${oldestSeq}`);
   loadingOlder = false;
   if (!result.ok) {
     banner = result.message;
@@ -567,6 +575,7 @@ async function loadOlder(): Promise<void> {
   }
   const existing = new Set(messages.map((message) => message.id));
   messages = [...result.data.messages.filter((message) => !existing.has(message.id)), ...messages];
+  hasOlder = result.data.hasMore;
   oldestSeq = messages[0]?.seq ?? oldestSeq;
   paintThread();
 }
