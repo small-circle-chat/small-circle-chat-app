@@ -28,7 +28,61 @@ let viewerSrc: string | null = null;
 
 const root = app;
 
+bindVisualViewport();
 void boot();
+
+function bindVisualViewport(): void {
+  const viewport = window.visualViewport;
+  const smallViewport = measureViewportUnit("100svh");
+  let baselineHeight: number | null = null;
+  let trustReportedHeight = false;
+  let appliedHeight = -1;
+  let appliedTop = -1;
+  let pinFrame = 0;
+  const sync = () => {
+    const reported = Math.round(viewport?.height ?? window.innerHeight);
+    const offsetTop = Math.round(viewport?.offsetTop ?? 0);
+    if (baselineHeight === null) baselineHeight = reported;
+    if (reported !== baselineHeight || offsetTop !== 0) trustReportedHeight = true;
+    // On first load Safari can report the tall layout viewport while its URL
+    // bar and bottom toolbar are still covering the page. Stay within the
+    // small viewport until the visual viewport actually moves.
+    const height = !trustReportedHeight && smallViewport > 0 ? Math.min(reported, smallViewport) : reported;
+    if (height <= 0 || (height === appliedHeight && offsetTop === appliedTop)) return;
+    const scroller = document.querySelector<HTMLElement>("#thread .messages");
+    const pinned = scroller !== null && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48;
+    document.documentElement.style.setProperty("--vvh", `${height}px`);
+    document.documentElement.style.setProperty("--vv-top", `${offsetTop}px`);
+    appliedHeight = height;
+    appliedTop = offsetTop;
+    if (!pinned || !scroller) return;
+    cancelAnimationFrame(pinFrame);
+    pinFrame = requestAnimationFrame(() => {
+      scroller.scrollTop = scroller.scrollHeight;
+    });
+  };
+  sync();
+  viewport?.addEventListener("resize", sync);
+  viewport?.addEventListener("scroll", sync);
+  window.addEventListener("orientationchange", () => {
+    sync();
+    window.setTimeout(sync, 250);
+  });
+}
+
+function measureViewportUnit(height: string): number {
+  const probe = document.createElement("div");
+  probe.style.position = "fixed";
+  probe.style.top = "0";
+  probe.style.height = height;
+  probe.style.width = "0";
+  probe.style.pointerEvents = "none";
+  probe.style.visibility = "hidden";
+  document.documentElement.append(probe);
+  const measured = Math.round(probe.getBoundingClientRect().height);
+  probe.remove();
+  return measured;
+}
 
 async function boot(): Promise<void> {
   const params = new URLSearchParams(location.search);
@@ -268,23 +322,28 @@ function paintList(): void {
   paintTitle();
   const list = document.querySelector("#conversation-list");
   if (!list) return;
-  list.replaceChildren();
-  if (conversations.length === 0) {
-    list.append(el("p", "empty", "Find someone by their exact username."));
-    return;
-  }
-  for (const conversation of conversations) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "conversation";
-    button.setAttribute("aria-current", conversation.id === activeId ? "true" : "false");
-    const name = el("strong", "", conversation.peer.displayName);
-    const meta = el("span", "meta", `@${conversation.peer.username}`);
-    const preview = el("span", "preview", conversation.lastMessagePreview ?? "No messages yet");
-    button.append(name, meta, preview);
-    if (conversation.unreadCount > 0) button.append(el("span", "unread", String(conversation.unreadCount)));
-    button.addEventListener("click", () => void openConversation(conversation.id));
-    list.append(button);
+  const caret = captureComposerCaret();
+  try {
+    list.replaceChildren();
+    if (conversations.length === 0) {
+      list.append(el("p", "empty", "Find someone by their exact username."));
+      return;
+    }
+    for (const conversation of conversations) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "conversation";
+      button.setAttribute("aria-current", conversation.id === activeId ? "true" : "false");
+      const name = el("strong", "", conversation.peer.displayName);
+      const meta = el("span", "meta", `@${conversation.peer.username}`);
+      const preview = el("span", "preview", conversation.lastMessagePreview ?? "No messages yet");
+      button.append(name, meta, preview);
+      if (conversation.unreadCount > 0) button.append(el("span", "unread", String(conversation.unreadCount)));
+      button.addEventListener("click", () => void openConversation(conversation.id));
+      list.append(button);
+    }
+  } finally {
+    restoreComposerCaret(caret);
   }
 }
 
@@ -296,10 +355,11 @@ function paintTitle(): void {
 function paintThread(): void {
   const thread = document.querySelector("#thread");
   if (!thread) return;
-  thread.replaceChildren();
+  const caret = captureComposerCaret();
   const conversation = conversations.find((item) => item.id === activeId);
   if (!conversation) {
-    thread.append(el("p", "empty", "Choose a conversation or start a new one."));
+    thread.replaceChildren(el("p", "empty", "Choose a conversation or start a new one."));
+    thread.removeAttribute("data-conversation-id");
     return;
   }
   const head = el("div", "thread-head");
@@ -367,6 +427,25 @@ function paintThread(): void {
     figure.append(remove);
     draftsRow.append(figure);
   }
+  const parked = thread.querySelector("form.composer");
+  let form: HTMLFormElement;
+  if (parked instanceof HTMLFormElement && thread.getAttribute("data-conversation-id") === conversation.id) {
+    const box = parked.querySelector("textarea");
+    if (box instanceof HTMLTextAreaElement && box.value !== draftText) box.value = draftText;
+    form = parked;
+  } else {
+    form = buildComposer();
+  }
+  for (const child of [...thread.children]) {
+    if (child !== form) child.remove();
+  }
+  thread.setAttribute("data-conversation-id", conversation.id);
+  thread.append(head, older, scroller, typing, draftsRow, form);
+  scroller.scrollTop = scroller.scrollHeight;
+  restoreComposerCaret(caret);
+}
+
+function buildComposer(): HTMLFormElement {
   const form = document.createElement("form");
   form.className = "composer";
   const box = document.createElement("textarea");
@@ -418,8 +497,7 @@ function paintThread(): void {
     sendTyping(false);
     await sendMessage(body, pending.map((draft) => draft.file), pending.map((draft) => draft.url));
   });
-  thread.append(head, older, scroller, typing, draftsRow, form);
-  scroller.scrollTop = scroller.scrollHeight;
+  return form;
 }
 
 async function refresh(): Promise<void> {
@@ -736,9 +814,14 @@ function handleEvent(event: HubEvent): void {
   }
   if (event.type === "typing" && event.conversationId === activeId && event.userId !== me?.id) {
     peerTyping = event.active;
+    const caret = captureComposerCaret();
     const node = document.querySelector(".typing");
     const conversation = conversations.find((item) => item.id === activeId);
-    if (node && conversation) node.textContent = event.active ? `${conversation.peer.displayName} is typing` : "";
+    if (node && conversation) {
+      const next = event.active ? `${conversation.peer.displayName} is typing` : "";
+      if (node.textContent !== next) node.textContent = next;
+    }
+    restoreComposerCaret(caret);
     return;
   }
   if (event.type === "presence") {
@@ -823,4 +906,31 @@ function el(tag: string, className = "", text = ""): HTMLElement {
 
 function formatTime(timestamp: number): string {
   return new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }).format(timestamp);
+}
+
+type ComposerCaret = {
+  box: HTMLTextAreaElement;
+  start: number;
+  end: number;
+  value: string;
+};
+
+function captureComposerCaret(): ComposerCaret | null {
+  const box = document.querySelector("#thread textarea");
+  if (!(box instanceof HTMLTextAreaElement) || document.activeElement !== box) return null;
+  return { box, start: box.selectionStart, end: box.selectionEnd, value: box.value };
+}
+
+function restoreComposerCaret(caret: ComposerCaret | null): void {
+  applyComposerCaret(caret);
+  queueMicrotask(() => applyComposerCaret(caret));
+}
+
+function applyComposerCaret(caret: ComposerCaret | null): void {
+  if (!caret?.box.isConnected) return;
+  if (document.activeElement !== caret.box) caret.box.focus({ preventScroll: true });
+  if (caret.box.value !== caret.value) return;
+  if (caret.box.selectionStart !== caret.start || caret.box.selectionEnd !== caret.end) {
+    caret.box.setSelectionRange(caret.start, caret.end);
+  }
 }
