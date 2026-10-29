@@ -412,7 +412,7 @@ app.post("/api/conversations/:id/attachments", async (c) => {
   const form = await c.req.formData().catch(() => null);
   const file = form?.get("file");
   if (!(file instanceof File) || file.size < 1) return error(c, 400, "invalid_input", "Choose an image.");
-  if (file.size > MAX_ATTACHMENT_BYTES) return error(c, 413, "too_large", "Images must be 5 MB or smaller.");
+  if (file.size > MAX_ATTACHMENT_BYTES) return error(c, 413, "too_large", "Images must be 15 MB or smaller.");
   const header = new Uint8Array(await file.slice(0, 16).arrayBuffer());
   const contentType = sniffImage(header);
   if (!contentType) return error(c, 400, "invalid_input", "Use a JPEG, PNG, GIF, or WebP image.");

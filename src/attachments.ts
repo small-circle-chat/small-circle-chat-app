@@ -1,6 +1,6 @@
 import type { AttachmentDto } from "../shared/events";
 
-export const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024;
+export const MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024;
 export const MAX_ATTACHMENTS_PER_MESSAGE = 4;
 
 export type ImageContentType = "image/jpeg" | "image/png" | "image/gif" | "image/webp";
