@@ -412,7 +412,9 @@ function paintThread(): void {
     bubble.append(el("small", "", read ? `${caption} · Read` : caption));
     scroller.append(bubble);
   }
+  const transcript = el("div", "transcript");
   const typing = el("div", "typing", peerTyping ? `${conversation.peer.displayName} is typing` : "");
+  transcript.append(scroller, typing);
   const draftsRow = el("div", "drafts");
   for (const [index, draft] of drafts.entries()) {
     const figure = el("div", "draft");
@@ -440,7 +442,7 @@ function paintThread(): void {
     if (child !== form) child.remove();
   }
   thread.setAttribute("data-conversation-id", conversation.id);
-  thread.append(head, older, scroller, typing, draftsRow, form);
+  thread.append(head, older, transcript, draftsRow, form);
   scroller.scrollTop = scroller.scrollHeight;
   restoreComposerCaret(caret);
 }
