@@ -1,5 +1,7 @@
 import type { ApiError, ConversationDto, HubEvent, MessageDto, MessagePage, PublicUser, ReactionGroup } from "../shared/events";
 
+const APP_TITLE = "Small Circle Chat";
+
 const app = document.querySelector<HTMLElement>("#app");
 if (!app) throw new Error("Missing #app");
 
@@ -116,11 +118,11 @@ async function boot(): Promise<void> {
 }
 
 function renderAuth(): void {
-  document.title = "Messages";
+  document.title = APP_TITLE;
   root.innerHTML = "";
   const wrap = el("main", "auth");
   const card = el("section", "card");
-  card.append(el("h1", "", "Messages"));
+  card.append(el("h1", "", APP_TITLE));
   card.append(el("p", "lede", "Sign in with a link sent to your email. No password."));
   const tabs = el("div", "tabs");
   tabs.append(
@@ -363,7 +365,7 @@ function paintList(): void {
 
 function paintTitle(): void {
   const unread = conversations.reduce((total, conversation) => total + conversation.unreadCount, 0);
-  document.title = unread > 0 ? `(${unread}) Messages` : "Messages";
+  document.title = unread > 0 ? `(${unread}) ${APP_TITLE}` : APP_TITLE;
 }
 
 function paintThread(): void {
