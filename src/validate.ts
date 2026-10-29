@@ -49,6 +49,56 @@ export function normalizeClientMessageId(value: unknown): string | null {
   return value.toLowerCase();
 }
 
+export function normalizeUuid(value: unknown): string | null {
+  if (typeof value !== "string" || !UUID_PATTERN.test(value)) return null;
+  return value.toLowerCase();
+}
+
+const MAX_REACTION_LENGTH = 32;
+
+export function normalizeReactionEmoji(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim().normalize("NFC").replaceAll("\uFE0E", "");
+  if (trimmed.length < 1 || trimmed.length > MAX_REACTION_LENGTH) return null;
+  if (!isSingleGrapheme(trimmed)) return null;
+  const canonical = canonicalizeEmoji(trimmed);
+  if (!canonical || canonical.length > MAX_REACTION_LENGTH || !isSingleGrapheme(canonical)) return null;
+  return canonical;
+}
+
+function isSingleGrapheme(value: string): boolean {
+  const segments = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(value)];
+  return segments.length === 1;
+}
+
+function canonicalizeEmoji(value: string): string | null {
+  if (/\u{E007F}/u.test(value) || /[\u{E0020}-\u{E007E}]/u.test(value)) {
+    return /^\p{Extended_Pictographic}(?:[\u{E0020}-\u{E007E}])+\u{E007F}$/u.test(value) ? value : null;
+  }
+  if (/^\p{Regional_Indicator}{2}$/u.test(value)) return value;
+  const keycap = value.match(/^([#*0-9])\uFE0F*\u20E3$/u);
+  if (keycap?.[1]) return `${keycap[1]}\uFE0F\u20E3`;
+
+  const parts = value.split("\u200D");
+  if (parts.some((part) => part.length === 0)) return null;
+  const canonical: string[] = [];
+  for (const part of parts) {
+    const component = canonicalizeComponent(part);
+    if (!component) return null;
+    canonical.push(component);
+  }
+  return canonical.join("\u200D");
+}
+
+function canonicalizeComponent(part: string): string | null {
+  const match = part.match(/^(\p{Extended_Pictographic})\uFE0F*(\p{Emoji_Modifier})?$/u);
+  if (!match?.[1]) return null;
+  const base = match[1];
+  const modifier = match[2] ?? "";
+  const needsVariation = !/^\p{Emoji_Presentation}$/u.test(base);
+  return needsVariation ? `${base}\uFE0F${modifier}` : `${base}${modifier}`;
+}
+
 export function sameOrigin(request: Request): boolean {
   const origin = request.headers.get("Origin");
   if (!origin) return false;

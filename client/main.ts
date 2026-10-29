@@ -1,4 +1,4 @@
-import type { ApiError, ConversationDto, HubEvent, MessageDto, PublicUser } from "../shared/events";
+import type { ApiError, ConversationDto, HubEvent, MessageDto, MessagePage, PublicUser, ReactionGroup } from "../shared/events";
 
 const app = document.querySelector<HTMLElement>("#app");
 if (!app) throw new Error("Missing #app");
@@ -11,6 +11,7 @@ let conversations: ConversationDto[] = [];
 let activeId: string | null = null;
 let messages: LocalMessage[] = [];
 let oldestSeq: number | null = null;
+let hasOlder = false;
 let loadingOlder = false;
 let socket: WebSocket | null = null;
 let retryMs = 500;
@@ -25,10 +26,22 @@ let devLink = "";
 let draftText = "";
 let drafts: Array<{ file: File; url: string }> = [];
 let viewerSrc: string | null = null;
+let openReactionId: string | null = null;
+const reactionTails = new Map<string, Promise<void>>();
+
+const REACTION_PRESETS = [
+  { emoji: "\u2764\uFE0F", label: "heart" },
+  { emoji: "\u{1F44D}", label: "thumbs up" },
+  { emoji: "\u{1F44E}", label: "thumbs down" },
+  { emoji: "\u{1F602}", label: "face with tears of joy" },
+  { emoji: "\u203C\uFE0F", label: "double exclamation" },
+  { emoji: "\u2753", label: "question" },
+] as const;
 
 const root = app;
 
 bindVisualViewport();
+bindReactionDismiss();
 void boot();
 
 function bindVisualViewport(): void {
@@ -368,6 +381,7 @@ function paintThread(): void {
   back.type = "button";
   back.addEventListener("click", () => {
     activeId = null;
+    openReactionId = null;
     closeViewer();
     document.querySelector(".shell")?.classList.remove("thread-open");
     paintList();
@@ -388,10 +402,7 @@ function paintThread(): void {
     paintThread();
   });
   head.append(back, title, block);
-  const older = el("button", "ghost", loadingOlder ? "Loading…" : "Load earlier messages") as HTMLButtonElement;
-  older.type = "button";
-  older.disabled = loadingOlder || oldestSeq === null || oldestSeq <= 1;
-  older.addEventListener("click", () => void loadOlder());
+  const older = hasOlder || loadingOlder ? olderButton() : null;
   const scroller = el("div", "messages");
   if (banner) scroller.append(el("p", "banner", banner));
   if (messages.length === 0) scroller.append(el("p", "empty", "Say hello."));
@@ -409,10 +420,17 @@ function paintThread(): void {
     if (message.body) bubble.append(document.createTextNode(message.body));
     const caption = message.failed ? "Not sent. Retry from the composer." : message.pending ? "Sending…" : formatTime(message.createdAt);
     const read = message.senderId === me?.id && conversation.peerLastReadSeq >= message.seq && !message.pending;
+    bubble.dataset.messageId = message.id;
     bubble.append(el("small", "", read ? `${caption} · Read` : caption));
+    if (!message.pending && !message.failed) {
+      bubble.append(reactionDock(message));
+      bindLongPress(bubble, message.id);
+    }
     scroller.append(bubble);
   }
+  const transcript = el("div", "transcript");
   const typing = el("div", "typing", peerTyping ? `${conversation.peer.displayName} is typing` : "");
+  transcript.append(scroller, typing);
   const draftsRow = el("div", "drafts");
   for (const [index, draft] of drafts.entries()) {
     const figure = el("div", "draft");
@@ -440,9 +458,17 @@ function paintThread(): void {
     if (child !== form) child.remove();
   }
   thread.setAttribute("data-conversation-id", conversation.id);
-  thread.append(head, older, scroller, typing, draftsRow, form);
+  thread.append(head, ...(older ? [older] : []), transcript, draftsRow, form);
   scroller.scrollTop = scroller.scrollHeight;
   restoreComposerCaret(caret);
+}
+
+function olderButton(): HTMLButtonElement {
+  const older = el("button", "ghost", loadingOlder ? "Loading…" : "Load earlier messages") as HTMLButtonElement;
+  older.type = "button";
+  older.disabled = loadingOlder;
+  older.addEventListener("click", () => void loadOlder());
+  return older;
 }
 
 function buildComposer(): HTMLFormElement {
@@ -516,12 +542,14 @@ async function refresh(): Promise<void> {
 
 async function openConversation(id: string): Promise<void> {
   activeId = id;
+  openReactionId = null;
   peerTyping = false;
   banner = "";
   closeViewer();
   resetComposer();
   document.querySelector(".shell")?.classList.add("thread-open");
   messages = [];
+  hasOlder = false;
   paintList();
   paintThread();
   await reloadActive();
@@ -531,7 +559,7 @@ async function reloadActive(): Promise<void> {
   if (!activeId) return;
   const [detail, history] = await Promise.all([
     api<{ conversation: ConversationDto }>(`/api/conversations/${activeId}`),
-    api<{ messages: MessageDto[] }>(`/api/conversations/${activeId}/messages`),
+    api<MessagePage>(`/api/conversations/${activeId}/messages`),
   ]);
   if (!detail.ok) {
     banner = detail.message;
@@ -545,6 +573,7 @@ async function reloadActive(): Promise<void> {
   }
   upsertConversation(detail.data.conversation);
   messages = history.data.messages;
+  hasOlder = history.data.hasMore;
   oldestSeq = messages[0]?.seq ?? null;
   paintList();
   paintThread();
@@ -553,10 +582,10 @@ async function reloadActive(): Promise<void> {
 }
 
 async function loadOlder(): Promise<void> {
-  if (!activeId || oldestSeq === null) return;
+  if (!activeId || oldestSeq === null || !hasOlder || loadingOlder) return;
   loadingOlder = true;
   paintThread();
-  const result = await api<{ messages: MessageDto[] }>(`/api/conversations/${activeId}/messages?before_seq=${oldestSeq}`);
+  const result = await api<MessagePage>(`/api/conversations/${activeId}/messages?before_seq=${oldestSeq}`);
   loadingOlder = false;
   if (!result.ok) {
     banner = result.message;
@@ -565,6 +594,7 @@ async function loadOlder(): Promise<void> {
   }
   const existing = new Set(messages.map((message) => message.id));
   messages = [...result.data.messages.filter((message) => !existing.has(message.id)), ...messages];
+  hasOlder = result.data.hasMore;
   oldestSeq = messages[0]?.seq ?? oldestSeq;
   paintThread();
 }
@@ -645,6 +675,219 @@ function iconSvg(path: string): SVGSVGElement {
   return svg;
 }
 
+function reactionName(emoji: string): string {
+  return REACTION_PRESETS.find((preset) => preset.emoji === emoji)?.label ?? emoji;
+}
+
+function myReaction(message: LocalMessage): string | null {
+  return message.reactions.find((group) => me && group.userIds.includes(me.id))?.emoji ?? null;
+}
+
+function reactionDock(message: LocalMessage): HTMLElement {
+  const open = openReactionId === message.id;
+  const dock = el("div", "reaction-dock");
+  dock.append(reactionChips(message), reactionToggle(message, open), reactionBar(message, open));
+  return dock;
+}
+
+function reactionChips(message: LocalMessage): HTMLElement {
+  const row = el("div", "reaction-row");
+  row.hidden = message.reactions.length === 0;
+  for (const group of message.reactions) {
+    const mine = Boolean(me && group.userIds.includes(me.id));
+    const button = el("button", mine ? "chip mine" : "chip") as HTMLButtonElement;
+    button.type = "button";
+    const count = group.userIds.length;
+    const name = reactionName(group.emoji);
+    button.append(document.createTextNode(group.emoji));
+    if (count > 1) button.append(el("span", "count", String(count)));
+    button.setAttribute("aria-label", mine ? `Remove your ${name} reaction` : `React with ${name}`);
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const current = messages.find((item) => item.id === message.id);
+      const selected = current?.reactions.some((item) => item.emoji === group.emoji && me && item.userIds.includes(me.id));
+      void putReaction(message.id, selected ? null : group.emoji);
+    });
+    row.append(button);
+  }
+  return row;
+}
+
+function reactionToggle(message: LocalMessage, open: boolean): HTMLButtonElement {
+  const toggle = el("button", "react-toggle") as HTMLButtonElement;
+  toggle.type = "button";
+  toggle.setAttribute("aria-label", "Add reaction");
+  toggle.setAttribute("aria-expanded", open ? "true" : "false");
+  const icon = iconSvg("M12 5v14M5 12h14");
+  icon.setAttribute("width", "14");
+  icon.setAttribute("height", "14");
+  toggle.append(icon);
+  toggle.addEventListener("click", (event) => {
+    event.stopPropagation();
+    setReactionBar(message.id);
+  });
+  return toggle;
+}
+
+function reactionBar(message: LocalMessage, open: boolean): HTMLElement {
+  const bar = el("div", "react-bar");
+  bar.hidden = !open;
+  const selected = myReaction(message);
+  for (const preset of REACTION_PRESETS) {
+    const button = el("button", "", preset.emoji) as HTMLButtonElement;
+    button.type = "button";
+    button.dataset.emoji = preset.emoji;
+    button.setAttribute("aria-label", `React with ${preset.label}`);
+    button.setAttribute("aria-pressed", selected === preset.emoji ? "true" : "false");
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const current = messages.find((item) => item.id === message.id);
+      const already = current ? myReaction(current) === preset.emoji : false;
+      void putReaction(message.id, already ? null : preset.emoji);
+    });
+    bar.append(button);
+  }
+  return bar;
+}
+
+function setReactionBar(messageId: string, forceOpen = false): void {
+  openReactionId = !forceOpen && openReactionId === messageId ? null : messageId;
+  syncReactionDocks();
+}
+
+function syncReactionDocks(): void {
+  for (const bubble of document.querySelectorAll<HTMLElement>("#thread .bubble")) {
+    const message = messages.find((item) => item.id === bubble.dataset.messageId);
+    if (!message) continue;
+    bubble.classList.toggle("reacting", openReactionId === message.id);
+    bubble.querySelector(".reaction-dock")?.replaceWith(reactionDock(message));
+  }
+}
+
+function bindLongPress(bubble: HTMLElement, messageId: string): void {
+  let timer = 0;
+  let startX = 0;
+  let startY = 0;
+  let held = false;
+  const clear = () => window.clearTimeout(timer);
+  bubble.addEventListener("pointerdown", (event) => {
+    if (event.pointerType === "mouse") return;
+    if (!(event.target instanceof Element) || event.target.closest(".reaction-dock")) return;
+    held = false;
+    startX = event.clientX;
+    startY = event.clientY;
+    timer = window.setTimeout(() => {
+      held = true;
+      setReactionBar(messageId, true);
+    }, 450);
+  });
+  bubble.addEventListener("pointermove", (event) => {
+    if (!timer) return;
+    if (Math.hypot(event.clientX - startX, event.clientY - startY) > 10) clear();
+  });
+  bubble.addEventListener("pointerup", clear);
+  bubble.addEventListener("pointercancel", clear);
+  bubble.addEventListener("click", (event) => {
+    if (!held) return;
+    held = false;
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
+  bubble.addEventListener("contextmenu", (event) => {
+    if (window.matchMedia("(hover: hover) and (pointer: fine)").matches) return;
+    event.preventDefault();
+  });
+}
+
+function bindReactionDismiss(): void {
+  document.addEventListener("pointerdown", (event) => {
+    if (!openReactionId || !(event.target instanceof Node)) return;
+    const bubble = document.querySelector(`#thread .bubble[data-message-id="${CSS.escape(openReactionId)}"]`);
+    if (bubble?.contains(event.target)) return;
+    openReactionId = null;
+    syncReactionDocks();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape" || !openReactionId) return;
+    openReactionId = null;
+    syncReactionDocks();
+  });
+}
+
+function putReaction(messageId: string, emoji: string | null): void {
+  const previous = reactionTails.get(messageId) ?? Promise.resolve();
+  const next = previous.catch(() => undefined).then(() => sendReaction(messageId, emoji));
+  reactionTails.set(messageId, next);
+}
+
+async function sendReaction(messageId: string, emoji: string | null): Promise<void> {
+  const message = messages.find((item) => item.id === messageId);
+  if (!activeId || !message || message.pending || message.failed) return;
+  const conversationId = activeId;
+  const result = await api<{ reactions: ReactionGroup[] }>(
+    `/api/conversations/${conversationId}/messages/${messageId}/reaction`,
+    { method: "PUT", body: { emoji } },
+  );
+  if (activeId !== conversationId) return;
+  if (!result.ok) {
+    showBanner(result.message);
+    return;
+  }
+  clearBanner();
+  openReactionId = null;
+  applyReactionGroups(messageId, result.data.reactions);
+}
+
+function applyReactionGroups(messageId: string, reactions: ReactionGroup[]): void {
+  const message = messages.find((item) => item.id === messageId);
+  if (!message) return;
+  message.reactions = reactions;
+  refreshReactionControls(message);
+}
+
+function applyReactionEvent(messageId: string, userId: string, emoji: string | null): void {
+  const message = messages.find((item) => item.id === messageId);
+  if (!message) return;
+  const current = message.reactions.find((group) => group.userIds.includes(userId));
+  if ((current?.emoji ?? null) === emoji) return;
+  const reactions = message.reactions
+    .map((group) => ({ emoji: group.emoji, userIds: group.userIds.filter((id) => id !== userId) }))
+    .filter((group) => group.userIds.length > 0);
+  if (emoji) {
+    const existing = reactions.find((group) => group.emoji === emoji);
+    if (existing) existing.userIds.push(userId);
+    else reactions.push({ emoji, userIds: [userId] });
+  }
+  message.reactions = reactions;
+  refreshReactionControls(message);
+}
+
+function refreshReactionControls(message: LocalMessage): void {
+  const bubble = document.querySelector<HTMLElement>(`#thread .bubble[data-message-id="${CSS.escape(message.id)}"]`);
+  if (!bubble) return;
+  bubble.classList.toggle("reacting", openReactionId === message.id);
+  bubble.querySelector(".reaction-dock")?.replaceWith(reactionDock(message));
+}
+
+function showBanner(message: string): void {
+  banner = message;
+  const scroller = document.querySelector("#thread .messages");
+  if (!scroller) return;
+  let node = scroller.querySelector<HTMLElement>(":scope > .banner");
+  if (!node) {
+    node = el("p", "banner", message);
+    scroller.prepend(node);
+    return;
+  }
+  node.hidden = false;
+  node.textContent = message;
+}
+
+function clearBanner(): void {
+  banner = "";
+  document.querySelector("#thread .messages > .banner")?.remove();
+}
+
 function markFailed(clientMsgId: string): void {
   const failed = messages.find((message) => message.clientMsgId === clientMsgId);
   if (failed) {
@@ -694,6 +937,7 @@ async function sendMessage(body: string, files: File[], previews: string[]): Pro
     body,
     createdAt: Date.now(),
     attachments: [],
+    reactions: [],
     localPreviews: previews,
     pending: true,
   };
@@ -829,6 +1073,10 @@ function handleEvent(event: HubEvent): void {
       if (conversation.peer.id === event.userId) conversation.peerOnline = event.online;
     }
     paintThread();
+    return;
+  }
+  if (event.type === "reaction" && event.conversationId === activeId) {
+    applyReactionEvent(event.messageId, event.userId, event.emoji);
   }
 }
 

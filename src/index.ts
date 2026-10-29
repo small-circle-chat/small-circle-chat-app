@@ -30,6 +30,7 @@ import {
 } from "./attachments";
 import { deliverMagicLink, MailDeliveryError } from "./mail";
 import { insertMessage, listMessages, markRead, publishMessage } from "./messages";
+import { publishReaction, setMessageReaction } from "./reactions";
 import { fanOut, UserHub } from "./user-hub";
 import {
   allowsDevLink,
@@ -38,7 +39,9 @@ import {
   normalizeDisplayName,
   normalizeEmail,
   normalizeMessageBody,
+  normalizeReactionEmoji,
   normalizeUsername,
+  normalizeUuid,
   sameOrigin,
 } from "./validate";
 
@@ -387,11 +390,11 @@ app.get("/api/conversations/:id/messages", async (c) => {
     return error(c, 400, "invalid_input", "Sequence cursors must be positive integers.");
   }
   if (before && after) return error(c, 400, "invalid_input", "Choose one sequence cursor.");
-  const messages = await listMessages(c.env.DB, conversation.id, {
+  const page = await listMessages(c.env.DB, conversation.id, {
     beforeSeq: before ?? undefined,
     afterSeq: after ?? undefined,
   });
-  return c.json({ messages });
+  return c.json(page);
 });
 
 app.post("/api/conversations/:id/attachments", async (c) => {
@@ -518,6 +521,42 @@ app.post("/api/conversations/:id/messages", async (c) => {
     }
   }
   return c.json({ message: inserted.message, idempotentReplay: inserted.replay }, inserted.replay ? 200 : 201);
+});
+
+app.put("/api/conversations/:id/messages/:messageId/reaction", async (c) => {
+  if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
+  const user = c.get("user");
+  const conversation = await requireConversation(c);
+  if (conversation instanceof Response) return conversation;
+  if (!(await allow(c.env.SEND_RATE_LIMITER, `react:${user.id}`))) {
+    return error(c, 429, "rate_limited", "Too many reactions. Wait a minute and try again.");
+  }
+  if (await isBlocked(c.env.DB, user.id, conversation.peer.id)) {
+    return error(c, 403, "blocked", "You cannot message this user.");
+  }
+
+  const messageId = normalizeUuid(c.req.param("messageId"));
+  const body = await readJson(c);
+  if (!messageId) return error(c, 400, "invalid_input", "That message does not exist.");
+  if (!body || !("emoji" in body)) return error(c, 400, "invalid_input", "Choose a single emoji, or remove your reaction.");
+  const emoji = body.emoji === null ? null : normalizeReactionEmoji(body.emoji);
+  if (body.emoji !== null && !emoji) return error(c, 400, "invalid_input", "Choose a single emoji.");
+
+  const result = await setMessageReaction(c.env.DB, {
+    conversationId: conversation.id,
+    messageId,
+    userId: user.id,
+    emoji,
+  });
+  if (!result) return error(c, 404, "not_found", "Message not found.");
+  if (result.changed) {
+    try {
+      await publishReaction(c.env, conversation.id, messageId, user.id, emoji);
+    } catch (error) {
+      console.error("reaction fan-out failed", error);
+    }
+  }
+  return c.json({ reactions: result.reactions });
 });
 
 app.post("/api/conversations/:id/read", async (c) => {
