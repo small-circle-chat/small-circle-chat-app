@@ -21,7 +21,7 @@ export async function deliverMagicLink(env: Env, email: string, link: string): P
       transactional: true,
       from: {
         email: env.MAIL_FROM,
-        name: env.MAIL_FROM_NAME || "Messages",
+        name: env.MAIL_FROM_NAME || "Small Circle Chat",
       },
       personalizations: [{ to: [{ email }] }],
       subject: "Your sign-in link",

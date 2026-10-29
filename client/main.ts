@@ -1,5 +1,7 @@
 import type { ApiError, ConversationDto, HubEvent, MessageDto, MessagePage, PublicUser, ReactionGroup } from "../shared/events";
 
+const APP_TITLE = "Small Circle Chat";
+
 const app = document.querySelector<HTMLElement>("#app");
 if (!app) throw new Error("Missing #app");
 
@@ -27,6 +29,7 @@ let draftText = "";
 let drafts: Array<{ file: File; url: string }> = [];
 let viewerSrc: string | null = null;
 let openReactionId: string | null = null;
+let copiedMessageId: string | null = null;
 const reactionTails = new Map<string, Promise<void>>();
 
 const REACTION_PRESETS = [
@@ -115,11 +118,11 @@ async function boot(): Promise<void> {
 }
 
 function renderAuth(): void {
-  document.title = "Messages";
+  document.title = APP_TITLE;
   root.innerHTML = "";
   const wrap = el("main", "auth");
   const card = el("section", "card");
-  card.append(el("h1", "", "Messages"));
+  card.append(el("h1", "", APP_TITLE));
   card.append(el("p", "lede", "Sign in with a link sent to your email. No password."));
   const tabs = el("div", "tabs");
   tabs.append(
@@ -362,7 +365,7 @@ function paintList(): void {
 
 function paintTitle(): void {
   const unread = conversations.reduce((total, conversation) => total + conversation.unreadCount, 0);
-  document.title = unread > 0 ? `(${unread}) Messages` : "Messages";
+  document.title = unread > 0 ? `(${unread}) ${APP_TITLE}` : APP_TITLE;
 }
 
 function paintThread(): void {
@@ -659,19 +662,22 @@ function paintViewer(): void {
   close.focus();
 }
 
-function iconSvg(path: string): SVGSVGElement {
+function iconSvg(path: string | readonly string[]): SVGSVGElement {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", "0 0 24 24");
   svg.setAttribute("width", "22");
   svg.setAttribute("height", "22");
   svg.setAttribute("aria-hidden", "true");
-  const shape = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  shape.setAttribute("d", path);
-  shape.setAttribute("fill", "none");
-  shape.setAttribute("stroke", "currentColor");
-  shape.setAttribute("stroke-width", "2");
-  shape.setAttribute("stroke-linecap", "round");
-  svg.append(shape);
+  for (const d of typeof path === "string" ? [path] : path) {
+    const shape = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    shape.setAttribute("d", d);
+    shape.setAttribute("fill", "none");
+    shape.setAttribute("stroke", "currentColor");
+    shape.setAttribute("stroke-width", "2");
+    shape.setAttribute("stroke-linecap", "round");
+    shape.setAttribute("stroke-linejoin", "round");
+    svg.append(shape);
+  }
   return svg;
 }
 
@@ -683,11 +689,84 @@ function myReaction(message: LocalMessage): string | null {
   return message.reactions.find((group) => me && group.userIds.includes(me.id))?.emoji ?? null;
 }
 
+const COPY_ICON = [
+  "M8 8h11a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2z",
+  "M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3",
+] as const;
+const CHECK_ICON = "M5 12.5 9.5 17 19 7";
+
 function reactionDock(message: LocalMessage): HTMLElement {
   const open = openReactionId === message.id;
   const dock = el("div", "reaction-dock");
-  dock.append(reactionChips(message), reactionToggle(message, open), reactionBar(message, open));
+  const parts: HTMLElement[] = [reactionChips(message), reactionToggle(message, open)];
+  if (open && message.body.trim()) parts.push(copyMessageButton(message));
+  parts.push(reactionBar(message, open));
+  dock.append(...parts);
   return dock;
+}
+
+function copyMessageButton(message: LocalMessage): HTMLButtonElement {
+  const button = el("button", "copy-message") as HTMLButtonElement;
+  button.type = "button";
+  button.setAttribute("aria-label", "Copy message");
+  if (copiedMessageId === message.id) showCopied(button);
+  else button.append(copyIcon());
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    void copyMessageText(message, button);
+  });
+  return button;
+}
+
+function copyIcon(): SVGSVGElement {
+  const icon = iconSvg(COPY_ICON);
+  icon.setAttribute("width", "18");
+  icon.setAttribute("height", "18");
+  return icon;
+}
+
+function showCopied(button: HTMLButtonElement): void {
+  button.classList.add("copied");
+  button.setAttribute("aria-label", "Copied");
+  const check = iconSvg(CHECK_ICON);
+  check.setAttribute("width", "18");
+  check.setAttribute("height", "18");
+  button.replaceChildren(check);
+}
+
+async function copyMessageText(message: LocalMessage, button: HTMLButtonElement): Promise<void> {
+  if (!(await writeClipboard(message.body))) return;
+  copiedMessageId = message.id;
+  const current = button.isConnected
+    ? button
+    : document.querySelector<HTMLButtonElement>(`#thread .bubble[data-message-id="${CSS.escape(message.id)}"] .copy-message`);
+  if (current) showCopied(current);
+}
+
+async function writeClipboard(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.top = "0";
+    area.style.left = "0";
+    area.style.opacity = "0";
+    document.body.append(area);
+    area.focus();
+    area.select();
+    let copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } catch {
+      copied = false;
+    }
+    area.remove();
+    return copied;
+  }
 }
 
 function reactionChips(message: LocalMessage): HTMLElement {
@@ -751,7 +830,16 @@ function reactionBar(message: LocalMessage, open: boolean): HTMLElement {
 }
 
 function setReactionBar(messageId: string, forceOpen = false): void {
-  openReactionId = !forceOpen && openReactionId === messageId ? null : messageId;
+  const next = !forceOpen && openReactionId === messageId ? null : messageId;
+  if (next !== openReactionId) copiedMessageId = null;
+  openReactionId = next;
+  if (openReactionId) window.getSelection()?.removeAllRanges();
+  syncReactionDocks();
+}
+
+function closeReactionBar(): void {
+  openReactionId = null;
+  copiedMessageId = null;
   syncReactionDocks();
 }
 
@@ -793,8 +881,8 @@ function bindLongPress(bubble: HTMLElement, messageId: string): void {
     event.preventDefault();
     event.stopPropagation();
   }, true);
+  bubble.addEventListener("selectstart", (event) => event.preventDefault());
   bubble.addEventListener("contextmenu", (event) => {
-    if (window.matchMedia("(hover: hover) and (pointer: fine)").matches) return;
     event.preventDefault();
   });
 }
@@ -804,13 +892,11 @@ function bindReactionDismiss(): void {
     if (!openReactionId || !(event.target instanceof Node)) return;
     const bubble = document.querySelector(`#thread .bubble[data-message-id="${CSS.escape(openReactionId)}"]`);
     if (bubble?.contains(event.target)) return;
-    openReactionId = null;
-    syncReactionDocks();
+    closeReactionBar();
   });
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape" || !openReactionId) return;
-    openReactionId = null;
-    syncReactionDocks();
+    closeReactionBar();
   });
 }
 
@@ -835,6 +921,7 @@ async function sendReaction(messageId: string, emoji: string | null): Promise<vo
   }
   clearBanner();
   openReactionId = null;
+  copiedMessageId = null;
   applyReactionGroups(messageId, result.data.reactions);
 }
 
