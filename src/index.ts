@@ -9,6 +9,7 @@ import {
   findUserBySession,
   getConversation,
   isBlocked,
+  MAX_GROUP_MEMBERS,
   memberIds,
   listConversations,
   randomToken,
@@ -29,6 +30,7 @@ import {
   undoMessageInsert,
 } from "./attachments";
 import { cleanupAbandonedAttachments } from "./cleanup";
+import { createGroup, leaveGroup } from "./groups";
 import {
   inviteToken,
   listIncomingRequests,
@@ -48,7 +50,9 @@ import {
   normalizeClientMessageId,
   normalizeDisplayName,
   normalizeEmail,
+  normalizeGroupTitle,
   normalizeInviteToken,
+  normalizeMemberIds,
   normalizeMessageBody,
   normalizeReactionEmoji,
   normalizeUsername,
@@ -390,6 +394,49 @@ app.post("/api/invite/redeem", async (c) => {
   return conversationResponse(c, outcome.conversationId, outcome.created ? 201 : 200);
 });
 
+app.post("/api/groups", async (c) => {
+  if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
+  const user = c.get("user");
+  if (!(await allow(c.env.LOOKUP_RATE_LIMITER, `group:${user.id}`))) {
+    return error(c, 429, "rate_limited", "Too many requests. Wait a minute and try again.");
+  }
+  const body = await readJson(c);
+  const title = body ? normalizeGroupTitle(body.title) : "invalid";
+  if (title === "invalid") return error(c, 400, "invalid_input", "Group names can be up to 60 characters.");
+  const memberIds = body ? normalizeMemberIds(body.memberIds, MAX_GROUP_MEMBERS) : null;
+  if (!memberIds) return error(c, 400, "invalid_input", `Choose up to ${MAX_GROUP_MEMBERS - 1} people.`);
+
+  const outcome = await createGroup(c.env.DB, user.id, title, memberIds);
+  if (outcome.kind === "too_few") return error(c, 400, "invalid_input", "Choose at least 2 people for a group.");
+  if (outcome.kind === "too_many") {
+    return error(c, 400, "invalid_input", `Groups can have up to ${MAX_GROUP_MEMBERS} people, including you.`);
+  }
+  if (outcome.kind === "not_allowed") {
+    return error(c, 403, "forbidden", "You can only add people you already have a chat with.");
+  }
+  background(
+    c,
+    "conversation_opened",
+    fanOut(c.env, outcome.memberIds.filter((id) => id !== user.id), { type: "conversation_opened", conversationId: outcome.conversationId }),
+  );
+  return conversationResponse(c, outcome.conversationId, 201);
+});
+
+app.post("/api/conversations/:id/leave", async (c) => {
+  if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
+  const user = c.get("user");
+  const conversation = await requireConversation(c);
+  if (conversation instanceof Response) return conversation;
+  const outcome = await leaveGroup(c.env.DB, conversation.id, user.id);
+  if (outcome.kind === "not_group") return error(c, 400, "invalid_input", "You can only leave group chats.");
+  background(
+    c,
+    "conversation_updated",
+    fanOut(c.env, [user.id, ...outcome.remainingIds], { type: "conversation_updated", conversationId: conversation.id }),
+  );
+  return c.json({ ok: true });
+});
+
 app.get("/api/conversations/:id", async (c) => {
   const conversation = await requireConversation(c);
   if (conversation instanceof Response) return conversation;
@@ -421,7 +468,7 @@ app.post("/api/conversations/:id/attachments", async (c) => {
   if (!(await allow(c.env.SEND_RATE_LIMITER, `send:${user.id}`))) {
     return error(c, 429, "rate_limited", "Too many messages. Wait a minute and try again.");
   }
-  if (await isBlocked(c.env.DB, user.id, conversation.peer.id)) {
+  if (conversation.peer && (await isBlocked(c.env.DB, user.id, conversation.peer.id))) {
     return error(c, 403, "blocked", "You cannot message this user.");
   }
 
@@ -498,7 +545,7 @@ app.post("/api/conversations/:id/messages", async (c) => {
   if (!(await allow(c.env.SEND_RATE_LIMITER, `send:${user.id}`))) {
     return error(c, 429, "rate_limited", "Too many messages. Wait a minute and try again.");
   }
-  if (await isBlocked(c.env.DB, user.id, conversation.peer.id)) {
+  if (conversation.peer && (await isBlocked(c.env.DB, user.id, conversation.peer.id))) {
     return error(c, 403, "blocked", "You cannot message this user.");
   }
 
@@ -543,7 +590,7 @@ app.put("/api/conversations/:id/messages/:messageId/reaction", async (c) => {
   if (!(await allow(c.env.SEND_RATE_LIMITER, `react:${user.id}`))) {
     return error(c, 429, "rate_limited", "Too many reactions. Wait a minute and try again.");
   }
-  if (await isBlocked(c.env.DB, user.id, conversation.peer.id)) {
+  if (conversation.peer && (await isBlocked(c.env.DB, user.id, conversation.peer.id))) {
     return error(c, 403, "blocked", "You cannot message this user.");
   }
 
@@ -771,6 +818,8 @@ async function withPresence(
     const statuses = await Promise.all(
       chunk.map(async (conversation) => {
         try {
+          // Groups don't show online status, which saves a lookup per member.
+          if (!conversation.peer) return { online: false };
           return await env.USER_HUB.getByName(conversation.peer.id).presence();
         } catch (error) {
           console.error("presence lookup failed", error);

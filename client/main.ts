@@ -20,19 +20,22 @@ let retryMs = 500;
 let typingTimer = 0;
 let typingSentAt = 0;
 let typingSentActive = false;
-let peerTypingTimer = 0;
+// Who is typing in the open chat, each with a timer that hides them if "stopped" never arrives.
+const typingUsers = new Map<string, number>();
 // While someone keeps typing, say so at most this often; everyone else's hub hears each update.
 const TYPING_RESEND_MS = 3000;
 // If a "stopped typing" update is lost, hide the indicator after this long anyway.
 const TYPING_EXPIRE_MS = 6000;
-let peerTyping = false;
 let banner = "";
 let mode: "login" | "register" = "login";
-let accountOpen = false;
+type Page = "account" | "new-group";
+// A full page shown in place of a chat (on phones, in place of everything).
+let page: Page | null = null;
 let accountError = "";
 let accountDraft: { username: string; displayName: string } | null = null;
 let accountSaved = false;
-const ACCOUNT_PATH = "/account";
+const PAGE_PATHS: Record<Page, string> = { account: "/account", "new-group": "/groups/new" };
+let groupDraft = { title: "", selected: new Set<string>(), error: "" };
 let devLink = "";
 let draftText = "";
 let drafts: Array<{ file: File; url: string }> = [];
@@ -241,7 +244,7 @@ async function verify(token: string): Promise<void> {
 }
 
 async function showApp(): Promise<void> {
-  accountOpen = location.pathname === ACCOUNT_PATH;
+  page = pageFromPath(location.pathname);
   renderShell();
   connect();
   document.addEventListener("visibilitychange", () => {
@@ -373,7 +376,7 @@ function renderInviteRow(): HTMLElement {
 function renderShell(): void {
   root.innerHTML = "";
   const shell = el("div", "shell");
-  if (activeId || accountOpen) shell.classList.add("thread-open");
+  if (activeId || page) shell.classList.add("thread-open");
   const sidebar = el("aside", "sidebar");
   const head = el("div", "sidebar-head");
   const logout = el("button", "ghost", "Log out") as HTMLButtonElement;
@@ -384,9 +387,9 @@ function renderShell(): void {
     chatRequests = [];
     inviteToken = null;
     requestNote = null;
-    accountOpen = false;
+    page = null;
     accountDraft = null;
-    if (location.pathname === ACCOUNT_PATH) history.replaceState(null, "", "/");
+    if (pageFromPath(location.pathname)) history.replaceState(null, "", "/");
     closeViewer();
     socket?.close();
     banner = "";
@@ -394,10 +397,10 @@ function renderShell(): void {
   });
   const account = el("button", "ghost", "Account") as HTMLButtonElement;
   account.type = "button";
-  account.setAttribute("aria-pressed", accountOpen ? "true" : "false");
+  account.setAttribute("aria-pressed", page === "account" ? "true" : "false");
   account.addEventListener("click", () => {
-    if (accountOpen) closeAccount();
-    else openAccount();
+    if (page === "account") closePage();
+    else openPage("account");
   });
   const actions = el("div", "row");
   actions.append(account, logout);
@@ -433,6 +436,16 @@ function renderShell(): void {
     setRequestNote(result.data.message);
   });
   finder.append(renderInviteRow());
+  const groupRow = el("div", "row group-row");
+  const newGroup = el("button", "ghost", "New group") as HTMLButtonElement;
+  newGroup.type = "button";
+  newGroup.setAttribute("aria-pressed", page === "new-group" ? "true" : "false");
+  newGroup.addEventListener("click", () => {
+    if (page === "new-group") closePage();
+    else openPage("new-group");
+  });
+  groupRow.append(newGroup);
+  finder.append(groupRow);
   const list = el("div", "conversation-list");
   list.id = "conversation-list";
   sidebar.append(head, finder, list);
@@ -444,35 +457,41 @@ function renderShell(): void {
   paintThread();
 }
 
-function openAccount(): void {
-  if (location.pathname !== ACCOUNT_PATH) history.pushState({ view: "account" }, "", ACCOUNT_PATH);
-  showAccount();
+function pageFromPath(path: string): Page | null {
+  const match = (Object.entries(PAGE_PATHS) as Array<[Page, string]>).find(([, pagePath]) => pagePath === path);
+  return match?.[0] ?? null;
 }
 
-function showAccount(): void {
-  accountOpen = true;
+function openPage(next: Page): void {
+  if (location.pathname !== PAGE_PATHS[next]) history.pushState({ view: next }, "", PAGE_PATHS[next]);
+  showPage(next);
+}
+
+function showPage(next: Page): void {
+  page = next;
   accountError = "";
   accountDraft = null;
   accountSaved = false;
+  if (next === "new-group") groupDraft = { title: "", selected: new Set(), error: "" };
   activeId = null;
   openReactionId = null;
   closeViewer();
   renderShell();
 }
 
-function closeAccount(): void {
+function closePage(): void {
   // Opened from inside the app: step back so the browser's Back button stays in sync.
-  if (history.state?.view === "account") {
+  if (history.state?.view) {
     history.back();
     return;
   }
-  if (location.pathname === ACCOUNT_PATH) history.replaceState(null, "", "/");
-  hideAccount();
+  if (pageFromPath(location.pathname)) history.replaceState(null, "", "/");
+  hidePage();
 }
 
-function hideAccount(): void {
-  if (!accountOpen) return;
-  accountOpen = false;
+function hidePage(): void {
+  if (!page) return;
+  page = null;
   accountError = "";
   accountDraft = null;
   accountSaved = false;
@@ -482,9 +501,118 @@ function hideAccount(): void {
 function bindRoutes(): void {
   window.addEventListener("popstate", () => {
     if (!me) return;
-    if (location.pathname === ACCOUNT_PATH) showAccount();
-    else hideAccount();
+    const next = pageFromPath(location.pathname);
+    if (next) showPage(next);
+    else hidePage();
   });
+}
+
+const MAX_GROUP_PEOPLE = 25;
+
+/** People you can add to a group: everyone you already have a one-to-one chat with. */
+function groupContacts(): Array<{ id: string; username: string; displayName: string }> {
+  const byId = new Map<string, { id: string; username: string; displayName: string }>();
+  for (const conversation of conversations) {
+    const peer = conversation.peer;
+    if (peer && !peer.deleted) byId.set(peer.id, { id: peer.id, username: peer.username, displayName: peer.displayName });
+  }
+  return [...byId.values()].sort((left, right) => left.displayName.localeCompare(right.displayName));
+}
+
+function renderNewGroupPage(thread: Element): void {
+  thread.setAttribute("data-view", "new-group");
+  thread.removeAttribute("data-conversation-id");
+  const head = el("div", "thread-head");
+  const back = el("button", "ghost", "Back") as HTMLButtonElement;
+  back.type = "button";
+  back.addEventListener("click", () => closePage());
+  const title = el("div");
+  title.append(el("h2", "", "New group"));
+  title.append(el("div", "presence", `Up to ${MAX_GROUP_PEOPLE} people, including you`));
+  head.append(back, title, el("span", "head-spacer"));
+
+  const body = el("div", "account-page");
+  const form = document.createElement("form");
+  form.className = "account-form group-form";
+  const name = field("Group name (optional)", "text", "Book club");
+  name.input.maxLength = 60;
+  name.input.value = groupDraft.title;
+  name.input.addEventListener("input", () => {
+    groupDraft.title = name.input.value;
+  });
+  form.append(name.label);
+
+  const contacts = groupContacts();
+  const count = el("p", "meta group-count");
+  const create = el("button", "primary", "Create group") as HTMLButtonElement;
+  create.type = "submit";
+  const syncCount = () => {
+    const chosen = groupDraft.selected.size;
+    count.textContent =
+      chosen < 2 ? `Choose at least 2 people. ${chosen} selected.` : `${chosen} selected · ${chosen + 1} people with you`;
+    create.disabled = chosen < 2;
+  };
+
+  form.append(el("p", "group-heading", "People"));
+  if (contacts.length === 0) {
+    form.append(el("p", "meta", "You can add people you already have a chat with. Start some chats first."));
+  } else {
+    form.append(el("p", "meta account-hint", "You can add people you already have a chat with."));
+    const list = el("div", "member-picker");
+    for (const contact of contacts) {
+      const row = document.createElement("label");
+      row.className = "member-option";
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = groupDraft.selected.has(contact.id);
+      box.addEventListener("change", () => {
+        if (box.checked && groupDraft.selected.size >= MAX_GROUP_PEOPLE - 1) {
+          box.checked = false;
+          groupDraft.error = `Groups can have up to ${MAX_GROUP_PEOPLE} people, including you.`;
+          error.hidden = false;
+          error.textContent = groupDraft.error;
+          return;
+        }
+        if (box.checked) groupDraft.selected.add(contact.id);
+        else groupDraft.selected.delete(contact.id);
+        syncCount();
+      });
+      const who = el("span", "member-who");
+      who.append(el("strong", "", contact.displayName), el("span", "meta", `@${contact.username}`));
+      row.append(box, who);
+      list.append(row);
+    }
+    form.append(list);
+  }
+  form.append(count);
+  const error = el("p", "banner", groupDraft.error);
+  error.hidden = !groupDraft.error;
+  const actions = el("div", "row");
+  actions.append(create);
+  form.append(error, actions);
+  syncCount();
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (groupDraft.selected.size < 2) return;
+    create.disabled = true;
+    const result = await api<{ conversation: ConversationDto }>("/api/groups", {
+      method: "POST",
+      body: { title: groupDraft.title, memberIds: [...groupDraft.selected] },
+    });
+    create.disabled = false;
+    if (!result.ok) {
+      groupDraft.error = result.message;
+      error.hidden = false;
+      error.textContent = result.message;
+      return;
+    }
+    groupDraft = { title: "", selected: new Set(), error: "" };
+    upsertConversation(result.data.conversation);
+    await openConversation(result.data.conversation.id);
+  });
+  body.append(form);
+  thread.replaceChildren(head, body);
 }
 
 function renderAccountPage(thread: Element): void {
@@ -493,7 +621,7 @@ function renderAccountPage(thread: Element): void {
   const head = el("div", "thread-head");
   const back = el("button", "ghost", "Back") as HTMLButtonElement;
   back.type = "button";
-  back.addEventListener("click", () => closeAccount());
+  back.addEventListener("click", () => closePage());
   const title = el("div");
   title.append(el("h2", "", "Account"));
   title.append(el("div", "presence", me ? `@${me.username}` : ""));
@@ -567,9 +695,13 @@ function paintList(): void {
       button.type = "button";
       button.className = "conversation";
       button.setAttribute("aria-current", conversation.id === activeId ? "true" : "false");
-      const name = el("strong", "", conversation.peer.displayName);
-      const meta = el("span", "meta", `@${conversation.peer.username}`);
-      const preview = el("span", "preview", conversation.lastMessagePreview ?? "No messages yet");
+      const name = el("strong", "", conversationName(conversation));
+      const meta = el(
+        "span",
+        "meta",
+        conversation.peer ? `@${conversation.peer.username}` : `Group · ${conversation.members.length} people`,
+      );
+      const preview = el("span", "preview", previewText(conversation));
       button.append(name, meta, preview);
       if (conversation.unreadCount > 0) button.append(el("span", "unread", String(conversation.unreadCount)));
       button.addEventListener("click", () => void openConversation(conversation.id));
@@ -602,6 +734,81 @@ function renderRequests(): HTMLElement {
   return section;
 }
 
+function otherMembers(conversation: ConversationDto): ConversationDto["members"] {
+  return conversation.members.filter((member) => member.id !== me?.id);
+}
+
+/** A chat's name: the other person, the group's name, or its members' names. */
+function conversationName(conversation: ConversationDto): string {
+  if (conversation.peer) return conversation.peer.displayName;
+  if (conversation.title) return conversation.title;
+  const names = otherMembers(conversation).map((member) => member.displayName);
+  if (names.length <= 3) return names.join(", ") || "Group";
+  return `${names.slice(0, 2).join(", ")} and ${names.length - 2} others`;
+}
+
+function memberName(conversation: ConversationDto, userId: string): string {
+  if (userId === me?.id) return "You";
+  return conversation.members.find((member) => member.id === userId)?.displayName ?? "Former member";
+}
+
+function previewText(conversation: ConversationDto): string {
+  const text = conversation.lastMessagePreview;
+  if (!text) return conversation.type === "group" ? "No messages yet. Say hi to the group." : "No messages yet";
+  if (conversation.type !== "group" || !conversation.lastMessageSenderId) return text;
+  const name = memberName(conversation, conversation.lastMessageSenderId);
+  return `${name === "You" ? "You" : name.split(" ")[0]}: ${text}`;
+}
+
+/** The newest message you've sent that the server has, which is where group read counts appear. */
+function lastOwnSentSeq(): number | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message && message.senderId === me?.id && !message.pending && !message.failed && !message.deletedAt) return message.seq;
+  }
+  return null;
+}
+
+function readLabel(conversation: ConversationDto, message: LocalMessage, groupReadSeq: number | null): string {
+  if (message.senderId !== me?.id || message.pending || message.failed) return "";
+  if (conversation.peer) return conversation.peerLastReadSeq >= message.seq ? " · Read" : "";
+  if (message.seq !== groupReadSeq) return "";
+  const others = otherMembers(conversation);
+  const readers = others.filter((member) => member.lastReadSeq >= message.seq).length;
+  if (readers === 0) return "";
+  return readers === others.length ? " · Read by everyone" : ` · Read by ${readers}`;
+}
+
+function typingText(conversation: ConversationDto): string {
+  const names = [...typingUsers.keys()].map((id) => memberName(conversation, id).split(" ")[0] ?? "Someone");
+  if (names.length === 0) return "";
+  if (conversation.peer) return `${conversation.peer.displayName} is typing`;
+  if (names.length === 1) return `${names[0]} is typing`;
+  if (names.length === 2) return `${names[0]} and ${names[1]} are typing`;
+  return `${names[0]} and ${names.length - 1} others are typing`;
+}
+
+function clearTypingUsers(): void {
+  for (const timer of typingUsers.values()) window.clearTimeout(timer);
+  typingUsers.clear();
+}
+
+async function leaveConversation(conversation: ConversationDto): Promise<void> {
+  if (!window.confirm(`Leave ${conversationName(conversation)}? You'll stop getting its messages.`)) return;
+  const result = await api<{ ok: true }>(`/api/conversations/${conversation.id}/leave`, { method: "POST" });
+  if (!result.ok) {
+    banner = result.message;
+    paintThread();
+    return;
+  }
+  conversations = conversations.filter((item) => item.id !== conversation.id);
+  activeId = null;
+  messages = [];
+  document.querySelector(".shell")?.classList.remove("thread-open");
+  paintList();
+  paintThread();
+}
+
 function paintTitle(): void {
   const unread = conversations.reduce((total, conversation) => total + conversation.unreadCount, 0) + chatRequests.length;
   document.title = unread > 0 ? `(${unread}) ${APP_TITLE}` : APP_TITLE;
@@ -610,12 +817,15 @@ function paintTitle(): void {
 function paintThread(): void {
   const thread = document.querySelector("#thread");
   if (!thread) return;
-  if (accountOpen) {
-    // Live updates repaint the thread often; leave the account page (and anything typed) alone.
-    if (thread.getAttribute("data-view") !== "account") renderAccountPage(thread);
+  if (page) {
+    // Live updates repaint the thread often; leave the page (and anything typed) alone.
+    if (thread.getAttribute("data-view") !== page) {
+      if (page === "account") renderAccountPage(thread);
+      else renderNewGroupPage(thread);
+    }
     return;
   }
-  if (thread.getAttribute("data-view") === "account") {
+  if (thread.hasAttribute("data-view")) {
     thread.removeAttribute("data-view");
     thread.replaceChildren();
   }
@@ -646,26 +856,44 @@ function paintThread(): void {
     paintList();
     paintThread();
   });
-  title.append(el("h2", "", conversation.peer.displayName));
-  title.append(el("div", "presence", conversation.peerOnline ? "Online" : "Offline"));
-  const block = el("button", "ghost", "Block") as HTMLButtonElement;
-  block.type = "button";
-  block.addEventListener("click", async () => {
-    const result = await api("/api/blocks", { method: "POST", body: { username: conversation.peer.username } });
+  title.append(el("h2", "", conversationName(conversation)));
+  const peer = conversation.peer;
+  if (peer) {
+    title.append(el("div", "presence", conversation.peerOnline ? "Online" : "Offline"));
+  } else {
+    const roster = el("div", "presence roster", `${conversation.members.length} people`);
+    roster.title = ["You", ...otherMembers(conversation).map((member) => member.displayName)].join(", ");
+    title.append(roster);
+  }
+  const action = el("button", "ghost", peer ? "Block" : "Leave") as HTMLButtonElement;
+  action.type = "button";
+  action.addEventListener("click", async () => {
+    if (!peer) {
+      await leaveConversation(conversation);
+      return;
+    }
+    const result = await api("/api/blocks", { method: "POST", body: { username: peer.username } });
     if (!result.ok) {
       banner = result.message;
       paintThread();
       return;
     }
-    banner = `${conversation.peer.displayName} is blocked.`;
+    banner = `${peer.displayName} is blocked.`;
     paintThread();
   });
-  head.append(back, title, block);
+  head.append(back, title, action);
+  const isGroup = conversation.type === "group";
+  const groupReadSeq = isGroup ? lastOwnSentSeq() : null;
+  let previousSender: string | null = null;
   const scroller = el("div", "messages");
   if (hasOlder || loadingOlder) scroller.append(olderButton());
   if (banner) scroller.append(el("p", "banner", banner));
   if (messages.length === 0) scroller.append(el("p", "empty", "Say hello."));
   for (const message of messages) {
+    if (isGroup && message.senderId !== me?.id && message.senderId !== previousSender) {
+      scroller.append(el("div", "sender-name", memberName(conversation, message.senderId)));
+    }
+    previousSender = message.senderId;
     const bubble = el("div", "bubble");
     if (message.senderId === me?.id) bubble.classList.add("mine");
     if (message.deletedAt) {
@@ -686,9 +914,8 @@ function paintThread(): void {
     }
     if (message.body) bubble.append(document.createTextNode(message.body));
     const caption = message.failed ? "Not sent. Retry from the composer." : message.pending ? "Sending…" : formatTime(message.createdAt);
-    const read = message.senderId === me?.id && conversation.peerLastReadSeq >= message.seq && !message.pending;
     bubble.dataset.messageId = message.id;
-    bubble.append(el("small", "", read ? `${caption} · Read` : caption));
+    bubble.append(el("small", "", `${caption}${readLabel(conversation, message, groupReadSeq)}`));
     if (!message.pending && !message.failed) {
       bubble.append(reactionDock(message));
       bindLongPress(bubble, message.id);
@@ -696,7 +923,7 @@ function paintThread(): void {
     scroller.append(bubble);
   }
   const transcript = el("div", "transcript");
-  const typing = el("div", "typing", peerTyping ? `${conversation.peer.displayName} is typing` : "");
+  const typing = el("div", "typing", typingText(conversation));
   const fade = el("div", "transcript-fade");
   const unseen = el("button", "new-messages") as HTMLButtonElement;
   unseen.type = "button";
@@ -868,7 +1095,20 @@ async function refresh(): Promise<void> {
     }
     return;
   }
+  const contactsBefore = groupContacts().map((contact) => contact.id).join();
   conversations = result.data.conversations;
+  if (page === "new-group" && groupContacts().map((contact) => contact.id).join() !== contactsBefore) {
+    // The people you can add changed (or just loaded); redraw, keeping the name and ticks in groupDraft.
+    document.querySelector("#thread")?.removeAttribute("data-view");
+    paintThread();
+  }
+  if (activeId && !conversations.some((item) => item.id === activeId)) {
+    // You left (or were removed from) the open chat.
+    activeId = null;
+    messages = [];
+    document.querySelector(".shell")?.classList.remove("thread-open");
+    paintThread();
+  }
   paintList();
   if (activeId) await reloadActive();
 }
@@ -876,15 +1116,15 @@ async function refresh(): Promise<void> {
 async function openConversation(id: string): Promise<void> {
   typingSentActive = false;
   typingSentAt = 0;
-  if (accountOpen) {
-    accountOpen = false;
-    if (location.pathname === ACCOUNT_PATH) history.replaceState(null, "", "/");
+  if (page) {
+    page = null;
+    if (pageFromPath(location.pathname)) history.replaceState(null, "", "/");
     renderShell();
   }
   activeId = id;
   unseenCount = 0;
   openReactionId = null;
-  peerTyping = false;
+  clearTypingUsers();
   banner = "";
   closeViewer();
   resetComposer();
@@ -1473,6 +1713,7 @@ function replaceMessage(message: MessageDto): void {
   }
   const isNew = message.seq > conversation.lastMessageSeq;
   conversation.lastMessagePreview = message.body.trim() ? message.body.slice(0, 140) : "Photo";
+  conversation.lastMessageSenderId = message.senderId;
   conversation.lastMessageAt = message.createdAt;
   if (isNew) conversation.lastMessageSeq = message.seq;
   if (isNew && message.senderId !== me?.id && activeId !== message.conversationId) {
@@ -1542,7 +1783,9 @@ function handleEvent(event: HubEvent): void {
     const conversation = conversations.find((item) => item.id === event.conversationId);
     if (!conversation) return;
     // Read positions only move forward; ignore an older one that arrives late.
-    if (event.userId === conversation.peer.id) conversation.peerLastReadSeq = Math.max(conversation.peerLastReadSeq, event.lastReadSeq);
+    if (event.userId === conversation.peer?.id) conversation.peerLastReadSeq = Math.max(conversation.peerLastReadSeq, event.lastReadSeq);
+    const member = conversation.members.find((item) => item.id === event.userId);
+    if (member) member.lastReadSeq = Math.max(member.lastReadSeq, event.lastReadSeq);
     if (event.userId === me?.id) {
       conversation.lastReadSeq = Math.max(conversation.lastReadSeq, event.lastReadSeq);
       conversation.unreadCount = 0;
@@ -1552,18 +1795,21 @@ function handleEvent(event: HubEvent): void {
     return;
   }
   if (event.type === "typing" && event.conversationId === activeId && event.userId !== me?.id) {
-    peerTyping = event.active;
-    window.clearTimeout(peerTypingTimer);
+    window.clearTimeout(typingUsers.get(event.userId));
+    typingUsers.delete(event.userId);
     if (event.active) {
-      peerTypingTimer = window.setTimeout(() => {
-        handleEvent({ type: "typing", conversationId: event.conversationId, userId: event.userId, active: false });
-      }, TYPING_EXPIRE_MS);
+      typingUsers.set(
+        event.userId,
+        window.setTimeout(() => {
+          handleEvent({ type: "typing", conversationId: event.conversationId, userId: event.userId, active: false });
+        }, TYPING_EXPIRE_MS),
+      );
     }
     const caret = captureComposerCaret();
     const node = document.querySelector(".typing");
     const conversation = conversations.find((item) => item.id === activeId);
     if (node && conversation) {
-      const next = event.active ? `${conversation.peer.displayName} is typing` : "";
+      const next = typingText(conversation);
       if (node.textContent !== next) node.textContent = next;
     }
     restoreComposerCaret(caret);
@@ -1571,7 +1817,7 @@ function handleEvent(event: HubEvent): void {
   }
   if (event.type === "presence") {
     for (const conversation of conversations) {
-      if (conversation.peer.id === event.userId) conversation.peerOnline = event.online;
+      if (conversation.peer?.id === event.userId) conversation.peerOnline = event.online;
     }
     paintThread();
     return;
@@ -1582,6 +1828,10 @@ function handleEvent(event: HubEvent): void {
   }
   if (event.type === "chat_request") {
     void loadRequests();
+    return;
+  }
+  if (event.type === "conversation_updated") {
+    void refresh();
     return;
   }
   if (event.type === "conversation_opened") {

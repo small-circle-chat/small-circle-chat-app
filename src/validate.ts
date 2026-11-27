@@ -118,3 +118,26 @@ export function normalizeInviteToken(value: unknown): string | null {
   const token = value.trim();
   return INVITE_TOKEN_PATTERN.test(token) ? token : null;
 }
+
+export const GROUP_TITLE_MAX = 60;
+
+/** A group name is optional: blank means "show the members' names instead". */
+export function normalizeGroupTitle(value: unknown): string | null | "invalid" {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") return "invalid";
+  const title = value.trim().replace(/\s+/g, " ");
+  if (title.length === 0) return null;
+  if ([...title].length > GROUP_TITLE_MAX) return "invalid";
+  return title;
+}
+
+export function normalizeMemberIds(value: unknown, max: number): string[] | null {
+  if (!Array.isArray(value) || value.length > max) return null;
+  const ids = new Set<string>();
+  for (const item of value) {
+    const id = normalizeUuid(item);
+    if (!id) return null;
+    ids.add(id);
+  }
+  return [...ids];
+}

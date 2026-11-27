@@ -62,7 +62,10 @@ export type ConversationDto = {
   lastMessageAt: number | null;
   lastMessagePreview: string | null;
   lastMessageSeq: number;
-  peer: Peer;
+  lastMessageSenderId: string | null;
+  /** The other person in a one-to-one chat; null in groups. */
+  peer: Peer | null;
+  /** One-to-one chats only; always false in groups. */
   peerOnline: boolean;
 };
 
@@ -80,7 +83,8 @@ export type HubEvent =
   | { type: "reaction"; conversationId: string; messageId: string; userId: string; emoji: string | null }
   | { type: "message_deleted"; conversationId: string; messageId: string }
   | { type: "chat_request" }
-  | { type: "conversation_opened"; conversationId: string };
+  | { type: "conversation_opened"; conversationId: string }
+  | { type: "conversation_updated"; conversationId: string };
 
 export type ApiError = {
   error: {
