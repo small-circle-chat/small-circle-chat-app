@@ -1,6 +1,7 @@
 /// <reference types="@cloudflare/vitest-pool-workers" />
 import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { openDirectResponse } from "./open-direct";
 
 const origin = "http://localhost";
 
@@ -9,7 +10,7 @@ describe("direct messages", () => {
     const ada = await register("ada@example.com", "ada", "Ada Lovelace");
     const alan = await register("alan@example.com", "alan", "Alan Turing");
 
-    const opened = await send(ada.cookie, "/api/conversations", { username: "alan" });
+    const opened = await openDirectResponse(ada.cookie, "alan");
     expect(opened.status).toBe(201);
     const conversationId = ((await opened.json()) as { conversation: { id: string } }).conversation.id;
 
@@ -59,9 +60,9 @@ describe("direct messages", () => {
     const ada = await register("ada@example.com", "ada", "Ada Lovelace");
     const alan = await register("alan@example.com", "alan", "Alan Turing");
     const grace = await register("grace@example.com", "grace", "Grace Hopper");
-    const opened = await send(ada.cookie, "/api/conversations", { username: "alan" });
+    const opened = await openDirectResponse(ada.cookie, "alan");
     const conversationId = ((await opened.json()) as { conversation: { id: string } }).conversation.id;
-    const other = await send(ada.cookie, "/api/conversations", { username: "grace" });
+    const other = await openDirectResponse(ada.cookie, "grace");
     const otherId = ((await other.json()) as { conversation: { id: string } }).conversation.id;
 
     const rejected = await upload(ada.cookie, conversationId, new TextEncoder().encode("<svg></svg>"), "x.svg", "image/svg+xml");
@@ -121,7 +122,7 @@ describe("direct messages", () => {
   it("renames a user and shows the new name in the other inbox", async () => {
     const ada = await register("ada@example.com", "ada", "Ada Lovelace");
     const alan = await register("alan@example.com", "alan", "Alan Turing");
-    expect((await send(ada.cookie, "/api/conversations", { username: "alan" })).status).toBe(201);
+    expect((await openDirectResponse(ada.cookie, "alan")).status).toBe(201);
 
     const invalid = await send(ada.cookie, "/api/me", { username: "Ada Lovelace" }, "PATCH");
     expect(invalid.status).toBe(400);
@@ -140,9 +141,9 @@ describe("direct messages", () => {
     expect(peer).toMatchObject({ username: "augusta", displayName: "Augusta Ada" });
 
     const released = await register("byron@example.com", "ada", "Annabella");
-    const found = await send(alan.cookie, "/api/users?username=ada", undefined, "GET");
-    expect(found.status).toBe(200);
-    const owner = ((await found.json()) as { user: { displayName: string } }).user;
+    const found = await openDirectResponse(alan.cookie, "ada");
+    expect(found.status).toBe(201);
+    const owner = ((await found.json()) as { conversation: { peer: { displayName: string } } }).conversation.peer;
     expect(owner.displayName).toBe("Annabella");
     expect(released.cookie).toContain("__Host-session=");
   });
@@ -150,7 +151,7 @@ describe("direct messages", () => {
   it("reports another page from one extra row, including when sequence numbers skip", async () => {
     const ada = await register("ada@example.com", "ada", "Ada Lovelace");
     const alan = await register("alan@example.com", "alan", "Alan Turing");
-    const opened = await send(ada.cookie, "/api/conversations", { username: "alan" });
+    const opened = await openDirectResponse(ada.cookie, "alan");
     const conversationId = ((await opened.json()) as { conversation: { id: string } }).conversation.id;
     const profile = await send(ada.cookie, "/api/me", undefined, "GET");
     const senderId = ((await profile.json()) as { user: { id: string } }).user.id;

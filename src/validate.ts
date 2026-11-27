@@ -110,3 +110,11 @@ export function allowsDevLink(request: Request, env: Env): boolean {
   const host = new URL(request.url).hostname;
   return host === "localhost" || host === "127.0.0.1";
 }
+
+const INVITE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+
+export function normalizeInviteToken(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const token = value.trim();
+  return INVITE_TOKEN_PATTERN.test(token) ? token : null;
+}

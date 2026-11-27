@@ -1,5 +1,5 @@
 import { Hono, type Context } from "hono";
-import type { ConversationDto } from "../shared/events";
+import type { ConversationDto, HubEvent } from "../shared/events";
 import {
   LOGIN_COOLDOWN_MS,
   LOGIN_TOKEN_TTL_MS,
@@ -10,7 +10,6 @@ import {
   getConversation,
   isBlocked,
   listConversations,
-  pairKey,
   randomToken,
   readCookie,
   sessionCookie,
@@ -29,6 +28,15 @@ import {
   undoMessageInsert,
 } from "./attachments";
 import { cleanupAbandonedAttachments } from "./cleanup";
+import {
+  inviteToken,
+  listIncomingRequests,
+  pruneRequestRecords,
+  redeemInvite,
+  resetInviteToken,
+  respondToRequest,
+  sendChatRequest,
+} from "./invites";
 import { deliverMagicLink, MailDeliveryError } from "./mail";
 import { deleteMessage, insertMessage, listMessages, markRead, publishMessage, publishMessageDeleted } from "./messages";
 import { publishReaction, setMessageReaction } from "./reactions";
@@ -39,6 +47,7 @@ import {
   normalizeClientMessageId,
   normalizeDisplayName,
   normalizeEmail,
+  normalizeInviteToken,
   normalizeMessageBody,
   normalizeReactionEmoji,
   normalizeUsername,
@@ -235,6 +244,7 @@ app.delete("/api/me", async (c) => {
   await c.env.DB.batch([
     c.env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(user.id),
     c.env.DB.prepare(`DELETE FROM login_tokens WHERE email = ?`).bind(user.email),
+    c.env.DB.prepare(`DELETE FROM invite_links WHERE user_id = ?`).bind(user.id),
     c.env.DB.prepare(
       `UPDATE users
        SET email = ?, username = ?, display_name = 'Deleted user', deleted_at = ?
@@ -243,27 +253,6 @@ app.delete("/api/me", async (c) => {
   ]);
   c.header("Set-Cookie", clearSessionCookie());
   return c.json({ ok: true });
-});
-
-app.get("/api/users", async (c) => {
-  const user = c.get("user");
-  const username = normalizeUsername(c.req.query("username"));
-  if (!username) return error(c, 400, "invalid_input", "Enter a username.");
-  if (!(await allow(c.env.LOOKUP_RATE_LIMITER, `lookup:${user.id}`))) {
-    return error(c, 429, "rate_limited", "Too many lookups. Wait a minute and try again.");
-  }
-
-  const found = await c.env.DB.prepare(
-    `SELECT id, username, display_name, deleted_at FROM users WHERE username = ?`,
-  )
-    .bind(username)
-    .first<{ id: string; username: string; display_name: string; deleted_at: number | null }>();
-  if (!found || found.deleted_at || found.id === user.id || (await isBlocked(c.env.DB, user.id, found.id))) {
-    return error(c, 404, "not_found", "No user has that username.");
-  }
-  return c.json({
-    user: { id: found.id, username: found.username, displayName: found.display_name },
-  });
 });
 
 app.get("/api/blocks", async (c) => {
@@ -291,7 +280,8 @@ app.post("/api/blocks", async (c) => {
   const target = await c.env.DB.prepare(`SELECT id FROM users WHERE username = ? AND deleted_at IS NULL`)
     .bind(username)
     .first<{ id: string }>();
-  if (!target || target.id === user.id) return error(c, 404, "not_found", "No user has that username.");
+  // Same reply whether or not the username exists, so blocking can't be used to probe usernames.
+  if (!target || target.id === user.id) return c.json({ ok: true });
   await c.env.DB.prepare(
     `INSERT INTO blocks (blocker_id, blocked_id, created_at) VALUES (?, ?, ?)
      ON CONFLICT (blocker_id, blocked_id) DO NOTHING`,
@@ -322,57 +312,79 @@ app.get("/api/conversations", async (c) => {
   return c.json({ conversations: await withPresence(c.env, conversations) });
 });
 
-app.post("/api/conversations", async (c) => {
+const REQUEST_SENT = "If that person is on Small Circle Chat, they'll get your request. The chat opens when they accept.";
+
+app.get("/api/chat-requests", async (c) => {
+  return c.json({ requests: await listIncomingRequests(c.env.DB, c.get("user").id) });
+});
+
+app.post("/api/chat-requests", async (c) => {
   if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
   const user = c.get("user");
   const body = await readJson(c);
   const username = body ? normalizeUsername(body.username) : null;
   if (!username) return error(c, 400, "invalid_input", "Enter a username.");
-  if (!(await allow(c.env.LOOKUP_RATE_LIMITER, `open:${user.id}`))) {
+  if (!(await allow(c.env.LOOKUP_RATE_LIMITER, `request:${user.id}`))) {
     return error(c, 429, "rate_limited", "Too many requests. Wait a minute and try again.");
   }
-
-  const other = await c.env.DB.prepare(`SELECT * FROM users WHERE username = ?`).bind(username).first<UserRow>();
-  if (!other || other.deleted_at || other.id === user.id) {
-    return error(c, 404, "not_found", "No user has that username.");
+  const outcome = await sendChatRequest(c.env.DB, user.id, username);
+  if (outcome.kind === "limited") {
+    return error(c, 429, "rate_limited", "You've sent a lot of chat requests today. Try again tomorrow.");
   }
-  if (await isBlocked(c.env.DB, user.id, other.id)) {
-    return error(c, 403, "blocked", "You cannot message this user.");
+  if (outcome.kind === "requested") {
+    c.executionCtx.waitUntil(notify(c.env, [outcome.recipientId], { type: "chat_request" }));
   }
-
-  const key = pairKey(user.id, other.id);
-  const existing = await c.env.DB.prepare(`SELECT id FROM conversations WHERE dm_pair_key = ?`)
-    .bind(key)
-    .first<{ id: string }>();
-  let conversationId = existing?.id;
-  if (!conversationId) {
-    conversationId = crypto.randomUUID();
-    const now = Date.now();
-    try {
-      await c.env.DB.batch([
-        c.env.DB.prepare(
-          `INSERT INTO conversations (id, type, dm_pair_key, created_at) VALUES (?, 'direct', ?, ?)`,
-        ).bind(conversationId, key, now),
-        c.env.DB.prepare(
-          `INSERT INTO conversation_members (conversation_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)`,
-        ).bind(conversationId, user.id, now),
-        c.env.DB.prepare(
-          `INSERT INTO conversation_members (conversation_id, user_id, role, joined_at) VALUES (?, ?, 'member', ?)`,
-        ).bind(conversationId, other.id, now),
-      ]);
-    } catch (error) {
-      const raced = await c.env.DB.prepare(`SELECT id FROM conversations WHERE dm_pair_key = ?`)
-        .bind(key)
-        .first<{ id: string }>();
-      if (!raced) throw error;
-      conversationId = raced.id;
-    }
+  if (outcome.kind === "opened") {
+    c.executionCtx.waitUntil(
+      notify(c.env, [user.id, outcome.otherId], { type: "conversation_opened", conversationId: outcome.conversationId }),
+    );
   }
+  // Identical reply in every case: it never says whether the username exists.
+  return c.json({ ok: true, message: REQUEST_SENT }, 202);
+});
 
-  const conversation = await getConversation(c.env.DB, user.id, conversationId);
-  if (!conversation) return error(c, 500, "missing_conversation", "The conversation could not be opened.");
-  const [withPeer] = await withPresence(c.env, [conversation]);
-  return c.json({ conversation: withPeer }, existing ? 200 : 201);
+app.post("/api/chat-requests/:requestId/:action", async (c) => {
+  if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
+  const user = c.get("user");
+  const action = c.req.param("action");
+  const requestId = normalizeUuid(c.req.param("requestId"));
+  if (action !== "accept" && action !== "decline" && action !== "block") return error(c, 404, "not_found", "Not found.");
+  if (!requestId) return error(c, 404, "not_found", "That request is no longer available.");
+  const result = await respondToRequest(c.env.DB, user.id, requestId, action);
+  if (!result) return error(c, 404, "not_found", "That request is no longer available.");
+  if (!result.conversationId) return c.json({ ok: true });
+  await notify(c.env, [user.id, result.senderId], { type: "conversation_opened", conversationId: result.conversationId });
+  return conversationResponse(c, result.conversationId, 200);
+});
+
+app.get("/api/invite", async (c) => {
+  return c.json({ token: await inviteToken(c.env.DB, c.get("user").id) });
+});
+
+app.post("/api/invite/reset", async (c) => {
+  if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
+  const user = c.get("user");
+  if (!(await allow(c.env.LOOKUP_RATE_LIMITER, `invite-reset:${user.id}`))) {
+    return error(c, 429, "rate_limited", "Too many requests. Wait a minute and try again.");
+  }
+  return c.json({ token: await resetInviteToken(c.env.DB, user.id) });
+});
+
+app.post("/api/invite/redeem", async (c) => {
+  if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
+  const user = c.get("user");
+  if (!(await allow(c.env.LOOKUP_RATE_LIMITER, `redeem:${user.id}`))) {
+    return error(c, 429, "rate_limited", "Too many requests. Wait a minute and try again.");
+  }
+  const body = await readJson(c);
+  const token = body ? normalizeInviteToken(body.token) : null;
+  const outcome = token ? await redeemInvite(c.env.DB, user.id, token) : ({ kind: "invalid" } as const);
+  if (outcome.kind === "invalid") return error(c, 404, "invalid_invite", "This invite link is no longer valid. Ask for a new one.");
+  if (outcome.kind === "own") return error(c, 400, "own_invite", "That's your own invite link. Send it to someone you want to chat with.");
+  if (outcome.created) {
+    await notify(c.env, [outcome.ownerId], { type: "conversation_opened", conversationId: outcome.conversationId });
+  }
+  return conversationResponse(c, outcome.conversationId, outcome.created ? 201 : 200);
 });
 
 app.get("/api/conversations/:id", async (c) => {
@@ -630,7 +642,7 @@ export default {
   fetch: app.fetch,
   async scheduled(_controller, env, ctx) {
     ctx.waitUntil(
-      cleanupAbandonedAttachments(env).then((removed) => {
+      Promise.all([cleanupAbandonedAttachments(env), pruneRequestRecords(env.DB)]).then(([removed]) => {
         console.log(`abandoned attachment cleanup removed ${removed} image(s)`);
       }),
     );
@@ -729,6 +741,21 @@ function startSession(c: AppContext, user: UserRow, now: number) {
     c.header("Set-Cookie", sessionCookie(token, Math.floor(SESSION_TTL_MS / 1000)));
     return c.json({ user: toPublicUser(user) });
   });
+}
+
+async function conversationResponse(c: AppContext, conversationId: string, status: 200 | 201) {
+  const conversation = await getConversation(c.env.DB, c.get("user").id, conversationId);
+  if (!conversation) return error(c, 500, "missing_conversation", "The conversation could not be opened.");
+  const [withPeer] = await withPresence(c.env, [conversation]);
+  return c.json({ conversation: withPeer }, status);
+}
+
+async function notify(env: Env, userIds: string[], event: HubEvent): Promise<void> {
+  try {
+    await fanOut(env, userIds, event);
+  } catch (error) {
+    console.error("fan-out failed", event.type, error);
+  }
 }
 
 async function requireConversation(c: AppContext) {
