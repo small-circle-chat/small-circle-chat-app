@@ -30,6 +30,15 @@ let drafts: Array<{ file: File; url: string }> = [];
 let viewerSrc: string | null = null;
 let openReactionId: string | null = null;
 let copiedMessageId: string | null = null;
+// Where the open thread is scrolled. "Pinned" means following the newest message;
+// otherwise the anchor is the first visible message and its offset from the top.
+let threadPinned = true;
+let threadAnchor: { messageId: string; offset: number } | null = null;
+let scrollToLatest = false;
+let programmaticScrollTop = -1;
+let scrollFrame = 0;
+// Messages from the other person that arrived while the reader was scrolled up.
+let unseenCount = 0;
 const reactionTails = new Map<string, Promise<void>>();
 
 const REACTION_PRESETS = [
@@ -378,6 +387,14 @@ function paintThread(): void {
     thread.removeAttribute("data-conversation-id");
     return;
   }
+  const previous = thread.querySelector<HTMLElement>(".messages");
+  if (previous && !scrollToLatest && thread.getAttribute("data-conversation-id") === conversation.id) {
+    rememberScroll(previous, true);
+  } else {
+    threadPinned = true;
+    threadAnchor = null;
+  }
+  scrollToLatest = false;
   const head = el("div", "thread-head");
   const title = el("div");
   const back = el("button", "ghost", "Back") as HTMLButtonElement;
@@ -405,8 +422,8 @@ function paintThread(): void {
     paintThread();
   });
   head.append(back, title, block);
-  const older = hasOlder || loadingOlder ? olderButton() : null;
   const scroller = el("div", "messages");
+  if (hasOlder || loadingOlder) scroller.append(olderButton());
   if (banner) scroller.append(el("p", "banner", banner));
   if (messages.length === 0) scroller.append(el("p", "empty", "Say hello."));
   for (const message of messages) {
@@ -441,7 +458,14 @@ function paintThread(): void {
   }
   const transcript = el("div", "transcript");
   const typing = el("div", "typing", peerTyping ? `${conversation.peer.displayName} is typing` : "");
-  transcript.append(scroller, typing);
+  const fade = el("div", "transcript-fade");
+  const unseen = el("button", "new-messages") as HTMLButtonElement;
+  unseen.type = "button";
+  unseen.addEventListener("click", () => {
+    scroller.scrollTo({ top: scroller.scrollHeight, behavior: "smooth" });
+    setUnseen(0);
+  });
+  transcript.append(scroller, fade, typing, unseen);
   const draftsRow = el("div", "drafts");
   for (const [index, draft] of drafts.entries()) {
     const figure = el("div", "draft");
@@ -469,13 +493,72 @@ function paintThread(): void {
     if (child !== form) child.remove();
   }
   thread.setAttribute("data-conversation-id", conversation.id);
-  thread.append(head, ...(older ? [older] : []), transcript, draftsRow, form);
-  scroller.scrollTop = scroller.scrollHeight;
+  thread.append(head, transcript, draftsRow, form);
+  restoreScroll(scroller);
+  if (threadPinned) unseenCount = 0;
+  paintUnseen();
+  scroller.addEventListener("scroll", () => {
+    cancelAnimationFrame(scrollFrame);
+    scrollFrame = requestAnimationFrame(() => rememberScroll(scroller));
+  }, { passive: true });
   restoreComposerCaret(caret);
 }
 
+function isAtBottom(scroller: HTMLElement): boolean {
+  return scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 48;
+}
+
+function firstVisibleMessage(scroller: HTMLElement): { messageId: string; offset: number } | null {
+  const top = scroller.getBoundingClientRect().top;
+  for (const bubble of scroller.querySelectorAll<HTMLElement>(".bubble[data-message-id]")) {
+    const rect = bubble.getBoundingClientRect();
+    if (rect.bottom > top && bubble.dataset.messageId) return { messageId: bubble.dataset.messageId, offset: rect.top - top };
+  }
+  return null;
+}
+
+/** Records where the reader is. Ignores scroll events caused only by content growing (images loading). */
+function rememberScroll(scroller: HTMLElement, force = false): void {
+  if (!force && scroller.scrollTop === programmaticScrollTop) return;
+  threadPinned = isAtBottom(scroller);
+  threadAnchor = threadPinned ? null : firstVisibleMessage(scroller);
+  if (threadPinned && unseenCount > 0) setUnseen(0);
+}
+
+function setUnseen(count: number): void {
+  unseenCount = count;
+  paintUnseen();
+}
+
+function paintUnseen(): void {
+  const button = document.querySelector<HTMLButtonElement>("#thread .new-messages");
+  const fade = document.querySelector<HTMLElement>("#thread .transcript-fade");
+  if (!button || !fade) return;
+  const label = unseenCount === 1 ? "1 new message" : `${unseenCount} new messages`;
+  button.hidden = unseenCount === 0;
+  fade.hidden = unseenCount === 0;
+  button.replaceChildren(document.createTextNode(label), el("span", "arrow", "\u2193"));
+  button.setAttribute("aria-label", `${label}. Jump to the latest.`);
+}
+
+/** Puts the reader back: at the newest message when pinned, else on the same message as before. */
+function restoreScroll(scroller: HTMLElement): void {
+  const bubble = threadAnchor
+    ? scroller.querySelector<HTMLElement>(`.bubble[data-message-id="${CSS.escape(threadAnchor.messageId)}"]`)
+    : null;
+  if (threadPinned || !threadAnchor || !bubble) {
+    threadPinned = true;
+    threadAnchor = null;
+    scroller.scrollTop = scroller.scrollHeight;
+  } else {
+    const offset = bubble.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+    scroller.scrollTop += offset - threadAnchor.offset;
+  }
+  programmaticScrollTop = scroller.scrollTop;
+}
+
 function olderButton(): HTMLButtonElement {
-  const older = el("button", "ghost", loadingOlder ? "Loading…" : "Load earlier messages") as HTMLButtonElement;
+  const older = el("button", "ghost older", loadingOlder ? "Loading…" : "Load earlier messages") as HTMLButtonElement;
   older.type = "button";
   older.disabled = loadingOlder;
   older.addEventListener("click", () => void loadOlder());
@@ -553,6 +636,7 @@ async function refresh(): Promise<void> {
 
 async function openConversation(id: string): Promise<void> {
   activeId = id;
+  unseenCount = 0;
   openReactionId = null;
   peerTyping = false;
   banner = "";
@@ -620,6 +704,10 @@ function image(src: string, viewable = false): HTMLElement {
   const img = document.createElement("img");
   img.className = "attachment";
   img.alt = "Image";
+  img.addEventListener("load", () => {
+    const scroller = img.closest<HTMLElement>("#thread .messages");
+    if (scroller) restoreScroll(scroller);
+  });
   img.src = src;
   if (!viewable) return img;
   const button = el("button", "attachment-button") as HTMLButtonElement;
@@ -1098,6 +1186,7 @@ async function sendMessage(body: string, files: File[], previews: string[]): Pro
     pending: true,
   };
   messages.push(optimistic);
+  scrollToLatest = true;
   paintThread();
   const attachmentIds: string[] = [];
   for (const file of files) {
@@ -1191,6 +1280,9 @@ function connect(): void {
 function handleEvent(event: HubEvent): void {
   if (event.type === "message") {
     if (event.conversationId === activeId) {
+      const scroller = document.querySelector<HTMLElement>("#thread .messages");
+      const isNew = !messages.some((item) => item.id === event.message.id || item.clientMsgId === event.message.clientMsgId);
+      if (isNew && event.message.senderId !== me?.id && scroller && !isAtBottom(scroller)) unseenCount += 1;
       replaceMessage(event.message);
       paintThread();
       void markRead(event.message.seq);
