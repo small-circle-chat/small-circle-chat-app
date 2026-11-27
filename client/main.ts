@@ -412,6 +412,14 @@ function paintThread(): void {
   for (const message of messages) {
     const bubble = el("div", "bubble");
     if (message.senderId === me?.id) bubble.classList.add("mine");
+    if (message.deletedAt) {
+      bubble.classList.add("deleted");
+      bubble.dataset.messageId = message.id;
+      bubble.append(el("span", "deleted-note", message.senderId === me?.id ? "You deleted this message" : "This message was deleted"));
+      bubble.append(el("small", "", formatTime(message.createdAt)));
+      scroller.append(bubble);
+      continue;
+    }
     if (message.pending) bubble.classList.add("pending");
     if (message.failed) bubble.classList.add("failed");
     for (const url of message.localPreviews ?? []) bubble.append(image(url, true));
@@ -700,6 +708,7 @@ function reactionDock(message: LocalMessage): HTMLElement {
   const dock = el("div", "reaction-dock");
   const parts: HTMLElement[] = [reactionChips(message), reactionToggle(message, open)];
   if (open && message.body.trim()) parts.push(copyMessageButton(message));
+  if (open && message.senderId === me?.id) parts.push(deleteMessageButton(message));
   parts.push(reactionBar(message, open));
   dock.append(...parts);
   return dock;
@@ -716,6 +725,65 @@ function copyMessageButton(message: LocalMessage): HTMLButtonElement {
     void copyMessageText(message, button);
   });
   return button;
+}
+
+const TRASH_ICON = [
+  "M4 7h16",
+  "M10 11v6M14 11v6",
+  "M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12",
+  "M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2",
+] as const;
+
+function deleteMessageButton(message: LocalMessage): HTMLButtonElement {
+  const button = el("button", "delete-message") as HTMLButtonElement;
+  button.type = "button";
+  button.setAttribute("aria-label", "Delete message for everyone");
+  button.title = "Delete for everyone";
+  const icon = iconSvg(TRASH_ICON);
+  icon.setAttribute("width", "18");
+  icon.setAttribute("height", "18");
+  button.append(icon);
+  button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    void deleteMessage(message.id);
+  });
+  return button;
+}
+
+async function deleteMessage(messageId: string): Promise<void> {
+  const conversationId = activeId;
+  if (!conversationId) return;
+  if (!window.confirm("Delete this message for everyone? This can't be undone.")) return;
+  const result = await api<{ ok: true }>(`/api/conversations/${conversationId}/messages/${messageId}`, {
+    method: "DELETE",
+  });
+  if (!result.ok) {
+    showBanner(result.message);
+    return;
+  }
+  applyDeletion(conversationId, messageId);
+  void refreshConversationList();
+}
+
+function applyDeletion(conversationId: string, messageId: string): void {
+  if (conversationId !== activeId) return;
+  const message = messages.find((item) => item.id === messageId);
+  if (!message || message.deletedAt) return;
+  const viewingThis = message.attachments.some((attachment) => viewerSrc?.endsWith(`/attachments/${attachment.id}`));
+  message.deletedAt = Date.now();
+  message.body = "";
+  message.attachments = [];
+  message.reactions = [];
+  if (openReactionId === messageId) openReactionId = null;
+  if (viewingThis) closeViewer();
+  paintThread();
+}
+
+async function refreshConversationList(): Promise<void> {
+  const result = await api<{ conversations: ConversationDto[] }>("/api/conversations");
+  if (!result.ok) return;
+  conversations = result.data.conversations;
+  paintList();
 }
 
 function copyIcon(): SVGSVGElement {
@@ -1023,6 +1091,7 @@ async function sendMessage(body: string, files: File[], previews: string[]): Pro
     seq: (messages.at(-1)?.seq ?? 0) + 1,
     body,
     createdAt: Date.now(),
+    deletedAt: null,
     attachments: [],
     reactions: [],
     localPreviews: previews,
@@ -1164,6 +1233,11 @@ function handleEvent(event: HubEvent): void {
   }
   if (event.type === "reaction" && event.conversationId === activeId) {
     applyReactionEvent(event.messageId, event.userId, event.emoji);
+    return;
+  }
+  if (event.type === "message_deleted") {
+    applyDeletion(event.conversationId, event.messageId);
+    void refreshConversationList();
   }
 }
 

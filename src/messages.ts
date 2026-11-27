@@ -125,7 +125,7 @@ export async function markRead(
     .prepare(
       `SELECT COUNT(*) AS count
        FROM messages
-       WHERE conversation_id = ? AND seq > ? AND sender_id != ?`,
+       WHERE conversation_id = ? AND seq > ? AND sender_id != ? AND deleted_at IS NULL`,
     )
     .bind(conversationId, nextSeq, userId)
     .first<{ count: number }>();
@@ -140,4 +140,76 @@ export async function markRead(
     .run();
 
   return nextSeq;
+}
+
+export type DeleteMessageResult = "deleted" | "already_deleted" | "not_found" | "forbidden";
+
+/**
+ * Deletes a message for every participant. The row stays as a tombstone (empty body,
+ * deleted_at set) so conversation sequence numbers never get reused, which keeps
+ * after_seq syncing and read receipts consistent. Its images and reactions are removed.
+ */
+export async function deleteMessage(
+  env: Env,
+  input: { conversationId: string; messageId: string; userId: string },
+): Promise<DeleteMessageResult> {
+  const db = env.DB;
+  const row = await db
+    .prepare(`SELECT sender_id, seq, deleted_at FROM messages WHERE id = ? AND conversation_id = ?`)
+    .bind(input.messageId, input.conversationId)
+    .first<{ sender_id: string; seq: number; deleted_at: number | null }>();
+  if (!row) return "not_found";
+  if (row.sender_id !== input.userId) return "forbidden";
+  if (row.deleted_at !== null) return "already_deleted";
+
+  const tombstoned = await db
+    .prepare(`UPDATE messages SET body = '', deleted_at = ? WHERE id = ? AND deleted_at IS NULL`)
+    .bind(Date.now(), input.messageId)
+    .run();
+  if (tombstoned.meta.changes < 1) return "already_deleted";
+
+  const keys = await db
+    .prepare(`SELECT r2_key FROM attachments WHERE message_id = ?`)
+    .bind(input.messageId)
+    .all<{ r2_key: string }>();
+
+  await db.batch([
+    db.prepare(`DELETE FROM message_reactions WHERE message_id = ?`).bind(input.messageId),
+    db.prepare(`DELETE FROM attachments WHERE message_id = ?`).bind(input.messageId),
+    db
+      .prepare(
+        `UPDATE conversation_members
+         SET unread_count = MAX(unread_count - 1, 0)
+         WHERE conversation_id = ? AND user_id != ? AND last_read_seq < ?`,
+      )
+      .bind(input.conversationId, row.sender_id, row.seq),
+    db
+      .prepare(
+        `UPDATE conversations
+         SET last_message_preview = (
+               SELECT CASE WHEN length(trim(body)) > 0 THEN substr(body, 1, 140) ELSE 'Photo' END
+               FROM messages WHERE conversation_id = ?1 AND deleted_at IS NULL ORDER BY seq DESC LIMIT 1
+             ),
+             last_message_sender_id = (
+               SELECT sender_id FROM messages WHERE conversation_id = ?1 AND deleted_at IS NULL ORDER BY seq DESC LIMIT 1
+             )
+         WHERE id = ?1`,
+      )
+      .bind(input.conversationId),
+  ]);
+
+  const r2Keys = keys.results.map((item) => item.r2_key);
+  if (r2Keys.length > 0) {
+    try {
+      await env.MEDIA.delete(r2Keys);
+    } catch (error) {
+      console.error("attachment cleanup failed", input.messageId, error);
+    }
+  }
+  return "deleted";
+}
+
+export async function publishMessageDeleted(env: Env, conversationId: string, messageId: string): Promise<void> {
+  const ids = await memberIds(env.DB, conversationId);
+  await fanOut(env, ids, { type: "message_deleted", conversationId, messageId });
 }

@@ -118,10 +118,10 @@ export async function undoMessageInsert(db: D1Database, conversationId: string, 
              last_message_at = (SELECT created_at FROM messages WHERE conversation_id = ?1 ORDER BY seq DESC LIMIT 1),
              last_message_preview = (
                SELECT CASE WHEN length(trim(body)) > 0 THEN substr(body, 1, 140) ELSE 'Photo' END
-               FROM messages WHERE conversation_id = ?1 ORDER BY seq DESC LIMIT 1
+               FROM messages WHERE conversation_id = ?1 AND deleted_at IS NULL ORDER BY seq DESC LIMIT 1
              ),
              last_message_sender_id = (
-               SELECT sender_id FROM messages WHERE conversation_id = ?1 ORDER BY seq DESC LIMIT 1
+               SELECT sender_id FROM messages WHERE conversation_id = ?1 AND deleted_at IS NULL ORDER BY seq DESC LIMIT 1
              )
          WHERE id = ?1`,
       )

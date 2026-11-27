@@ -29,7 +29,7 @@ import {
   undoMessageInsert,
 } from "./attachments";
 import { deliverMagicLink, MailDeliveryError } from "./mail";
-import { insertMessage, listMessages, markRead, publishMessage } from "./messages";
+import { deleteMessage, insertMessage, listMessages, markRead, publishMessage, publishMessageDeleted } from "./messages";
 import { publishReaction, setMessageReaction } from "./reactions";
 import { fanOut, UserHub } from "./user-hub";
 import {
@@ -557,6 +557,30 @@ app.put("/api/conversations/:id/messages/:messageId/reaction", async (c) => {
     }
   }
   return c.json({ reactions: result.reactions });
+});
+
+app.delete("/api/conversations/:id/messages/:messageId", async (c) => {
+  if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
+  const user = c.get("user");
+  const conversation = await requireConversation(c);
+  if (conversation instanceof Response) return conversation;
+  if (!(await allow(c.env.SEND_RATE_LIMITER, `delete:${user.id}`))) {
+    return error(c, 429, "rate_limited", "Too many deletions. Wait a minute and try again.");
+  }
+  const messageId = normalizeUuid(c.req.param("messageId"));
+  if (!messageId) return error(c, 404, "not_found", "Message not found.");
+
+  const result = await deleteMessage(c.env, { conversationId: conversation.id, messageId, userId: user.id });
+  if (result === "not_found") return error(c, 404, "not_found", "Message not found.");
+  if (result === "forbidden") return error(c, 403, "forbidden", "You can only delete your own messages.");
+  if (result === "deleted") {
+    try {
+      await publishMessageDeleted(c.env, conversation.id, messageId);
+    } catch (error) {
+      console.error("delete fan-out failed", error);
+    }
+  }
+  return c.json({ ok: true });
 });
 
 app.post("/api/conversations/:id/read", async (c) => {
