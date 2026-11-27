@@ -491,3 +491,16 @@ body:has(.viewer) { overflow: hidden; }
 }
 
 button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.system-line { align-self: center; max-width: 85%; text-align: center; color: var(--muted); font-family: "Avenir Next", "Segoe UI", sans-serif; font-size: 0.82rem; line-height: 1.35; }
+.system-line small { display: block; margin-top: 2px; font-size: 0.72rem; opacity: 0.8; }
+.bubble.hidden-message { background: transparent; border-style: dashed; }
+.bubble.hidden-message .deleted-note { color: var(--muted); font-style: italic; }
+.detail-section { margin-top: 22px; }
+.detail-section:first-of-type { margin-top: 0; }
+.detail-section .row { margin-top: 10px; gap: 6px; flex-wrap: wrap; }
+.member-row { cursor: default; flex-wrap: wrap; }
+.member-row .member-who { flex: 1 1 auto; }
+.role-badge { flex: none; padding: 1px 8px; border-radius: 999px; background: #e6f1ec; color: var(--accent); font-family: "Avenir Next", "Segoe UI", sans-serif; font-size: 0.72rem; }
+.member-actions { flex: none; margin-top: 0; gap: 6px; }
+.ghost.small { padding: 4px 10px; font-size: 0.85rem; }

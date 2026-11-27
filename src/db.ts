@@ -24,6 +24,7 @@ export type MessageRow = {
   body: string;
   created_at: number;
   deleted_at: number | null;
+  kind?: "text" | "system";
 };
 
 export type LoginTokenRow = {
@@ -60,6 +61,7 @@ export function toMessage(
     seq: row.seq,
     body: row.body,
     createdAt: row.created_at,
+    kind: row.kind ?? "text",
     deletedAt: row.deleted_at ?? null,
     attachments: row.deleted_at ? [] : attachments,
     reactions: row.deleted_at ? [] : reactions,
@@ -167,6 +169,10 @@ export type ConversationRecord = {
   lastMessagePreview: string | null;
   lastMessageSeq: number;
   lastMessageSenderId: string | null;
+  lastMessageKind: "text" | "system" | null;
+  formerMembers: Peer[];
+  /** The first message number you can see; later joiners don't get earlier history. */
+  historyFromSeq: number;
   /** The other person in a one-to-one chat; null in groups. */
   peer: Peer | null;
 };
@@ -181,6 +187,8 @@ type ConversationRow = {
   last_message_preview: string | null;
   last_message_seq: number;
   last_message_sender_id: string | null;
+  last_message_kind: "text" | "system" | null;
+  history_from_seq: number;
 };
 
 export function toConversation(row: ConversationRow, members: MemberDto[], userId: string): ConversationRecord {
@@ -197,6 +205,9 @@ export function toConversation(row: ConversationRow, members: MemberDto[], userI
     lastMessagePreview: row.last_message_preview,
     lastMessageSeq: row.last_message_seq,
     lastMessageSenderId: row.last_message_sender_id,
+    lastMessageKind: row.last_message_kind,
+    formerMembers: [],
+    historyFromSeq: row.history_from_seq,
     peer: other
       ? { id: other.id, username: other.username, displayName: other.displayName, deleted: other.deleted }
       : null,
@@ -212,7 +223,9 @@ const conversationSelect = `
          c.last_message_at,
          c.last_message_preview,
          c.last_message_seq,
-         c.last_message_sender_id
+         c.last_message_sender_id,
+         c.last_message_kind,
+         me.history_from_seq
   FROM conversation_members me
   JOIN conversations c ON c.id = me.conversation_id
 `;
@@ -278,6 +291,25 @@ export async function getConversation(
     .bind(userId, conversationId)
     .first<ConversationRow>();
   if (!row) return null;
-  const members = await membersFor(db, [row.id]);
-  return toConversation(row, members.get(row.id) ?? [], userId);
+  const [members, former] = await Promise.all([membersFor(db, [row.id]), formerMembersOf(db, row.id)]);
+  return { ...toConversation(row, members.get(row.id) ?? [], userId), formerMembers: former };
+}
+
+/** People whose messages are still in a chat they've left, so their names can still be shown. */
+async function formerMembersOf(db: D1Database, conversationId: string): Promise<Peer[]> {
+  const result = await db
+    .prepare(
+      `SELECT u.id, u.username, u.display_name, u.deleted_at
+       FROM users u
+       WHERE u.id IN (SELECT DISTINCT sender_id FROM messages WHERE conversation_id = ?1)
+         AND u.id NOT IN (SELECT user_id FROM conversation_members WHERE conversation_id = ?1)`,
+    )
+    .bind(conversationId)
+    .all<{ id: string; username: string; display_name: string; deleted_at: number | null }>();
+  return result.results.map((row) => ({
+    id: row.id,
+    username: row.username,
+    displayName: row.deleted_at ? "Deleted user" : row.display_name,
+    deleted: row.deleted_at !== null,
+  }));
 }

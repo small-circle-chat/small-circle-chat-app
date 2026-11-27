@@ -31,6 +31,8 @@ export type MessageDto = {
   seq: number;
   body: string;
   createdAt: number;
+  /** "system" lines are things like "Alex added Blair": no reactions, never deleted. */
+  kind: "text" | "system";
   deletedAt: number | null;
   attachments: AttachmentDto[];
   reactions: ReactionGroup[];
@@ -63,6 +65,9 @@ export type ConversationDto = {
   lastMessagePreview: string | null;
   lastMessageSeq: number;
   lastMessageSenderId: string | null;
+  lastMessageKind: "text" | "system" | null;
+  /** People who sent messages here but have since left. Filled in when a single chat is loaded. */
+  formerMembers: Peer[];
   /** The other person in a one-to-one chat; null in groups. */
   peer: Peer | null;
   /** One-to-one chats only; always false in groups. */

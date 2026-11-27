@@ -6,7 +6,7 @@ import { fanOut } from "./user-hub";
 
 export async function insertMessage(
   db: D1Database,
-  input: { conversationId: string; senderId: string; clientMsgId: string; body: string },
+  input: { conversationId: string; senderId: string; clientMsgId: string; body: string; kind?: "text" | "system" },
 ): Promise<{ message: MessageDto; replay: boolean }> {
   const existing = await db
     .prepare(`SELECT * FROM messages WHERE conversation_id = ? AND client_msg_id = ?`)
@@ -30,10 +30,10 @@ export async function insertMessage(
         .bind(input.conversationId),
       db
         .prepare(
-          `INSERT INTO messages (id, conversation_id, sender_id, client_msg_id, seq, body, created_at)
-           SELECT ?1, ?2, ?3, ?4, seq_counter, ?5, ?6 FROM conversations WHERE id = ?2`,
+          `INSERT INTO messages (id, conversation_id, sender_id, client_msg_id, seq, body, created_at, kind)
+           SELECT ?1, ?2, ?3, ?4, seq_counter, ?5, ?6, ?7 FROM conversations WHERE id = ?2`,
         )
-        .bind(id, input.conversationId, input.senderId, input.clientMsgId, input.body, createdAt),
+        .bind(id, input.conversationId, input.senderId, input.clientMsgId, input.body, createdAt, input.kind ?? "text"),
     ]);
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
@@ -58,9 +58,11 @@ export async function publishMessage(env: Env, conversationId: string, message: 
 export async function listMessages(
   db: D1Database,
   conversationId: string,
-  options: { beforeSeq?: number; afterSeq?: number },
+  options: { beforeSeq?: number; afterSeq?: number; fromSeq?: number },
 ): Promise<MessagePage> {
   const limit = MESSAGE_PAGE_SIZE + 1;
+  // Nothing from before this person joined.
+  const floor = options.fromSeq ?? 0;
   if (options.afterSeq !== undefined) {
     const result = await db
       .prepare(
@@ -69,7 +71,7 @@ export async function listMessages(
          ORDER BY seq ASC
          LIMIT ?`,
       )
-      .bind(conversationId, options.afterSeq, limit)
+      .bind(conversationId, Math.max(options.afterSeq, floor), limit)
       .all<MessageRow>();
     const page = takePage(result.results);
     return { messages: await withAttachments(db, page.rows), hasMore: page.hasMore };
@@ -78,11 +80,11 @@ export async function listMessages(
   const result = await db
     .prepare(
       `SELECT * FROM messages
-       WHERE conversation_id = ? AND (? IS NULL OR seq < ?)
+       WHERE conversation_id = ? AND seq > ? AND (? IS NULL OR seq < ?)
        ORDER BY seq DESC
        LIMIT ?`,
     )
-    .bind(conversationId, options.beforeSeq ?? null, options.beforeSeq ?? null, limit)
+    .bind(conversationId, floor, options.beforeSeq ?? null, options.beforeSeq ?? null, limit)
     .all<MessageRow>();
   const page = takePage(result.results);
   return { messages: (await withAttachments(db, page.rows)).reverse(), hasMore: page.hasMore };
@@ -128,7 +130,7 @@ export async function markRead(
     .prepare(
       `SELECT COUNT(*) AS count
        FROM messages
-       WHERE conversation_id = ? AND seq > ? AND sender_id != ? AND deleted_at IS NULL`,
+       WHERE conversation_id = ? AND seq > ? AND sender_id != ? AND deleted_at IS NULL AND kind = 'text'`,
     )
     .bind(conversationId, nextSeq, userId)
     .first<{ count: number }>();
@@ -158,7 +160,7 @@ export async function deleteMessage(
 ): Promise<DeleteMessageResult> {
   const db = env.DB;
   const row = await db
-    .prepare(`SELECT sender_id, seq, deleted_at FROM messages WHERE id = ? AND conversation_id = ?`)
+    .prepare(`SELECT sender_id, seq, deleted_at FROM messages WHERE id = ? AND conversation_id = ? AND kind = 'text'`)
     .bind(input.messageId, input.conversationId)
     .first<{ sender_id: string; seq: number; deleted_at: number | null }>();
   if (!row) return "not_found";
@@ -190,11 +192,14 @@ export async function deleteMessage(
       .prepare(
         `UPDATE conversations
          SET last_message_preview = (
-               SELECT CASE WHEN length(trim(body)) > 0 THEN substr(body, 1, 140) ELSE 'Photo' END
+               SELECT CASE WHEN kind = 'system' OR length(trim(body)) > 0 THEN substr(body, 1, 140) ELSE 'Photo' END
                FROM messages WHERE conversation_id = ?1 AND deleted_at IS NULL ORDER BY seq DESC LIMIT 1
              ),
              last_message_sender_id = (
                SELECT sender_id FROM messages WHERE conversation_id = ?1 AND deleted_at IS NULL ORDER BY seq DESC LIMIT 1
+             ),
+             last_message_kind = (
+               SELECT kind FROM messages WHERE conversation_id = ?1 AND deleted_at IS NULL ORDER BY seq DESC LIMIT 1
              )
          WHERE id = ?1`,
       )

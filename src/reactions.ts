@@ -49,7 +49,7 @@ export async function setMessageReaction(
   input: { conversationId: string; messageId: string; userId: string; emoji: string | null },
 ): Promise<{ reactions: ReactionGroup[]; changed: boolean } | null> {
   const message = await db
-    .prepare(`SELECT id FROM messages WHERE id = ? AND conversation_id = ? AND deleted_at IS NULL`)
+    .prepare(`SELECT id FROM messages WHERE id = ? AND conversation_id = ? AND deleted_at IS NULL AND kind = 'text'`)
     .bind(input.messageId, input.conversationId)
     .first<{ id: string }>();
   if (!message) return null;

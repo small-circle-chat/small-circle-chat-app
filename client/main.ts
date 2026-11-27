@@ -28,13 +28,20 @@ const TYPING_RESEND_MS = 3000;
 const TYPING_EXPIRE_MS = 6000;
 let banner = "";
 let mode: "login" | "register" = "login";
-type Page = "account" | "new-group";
+type Page = "account" | "new-group" | "group";
 // A full page shown in place of a chat (on phones, in place of everything).
 let page: Page | null = null;
 let accountError = "";
 let accountDraft: { username: string; displayName: string } | null = null;
 let accountSaved = false;
-const PAGE_PATHS: Record<Page, string> = { account: "/account", "new-group": "/groups/new" };
+const PAGE_PATHS: Record<Exclude<Page, "group">, string> = { account: "/account", "new-group": "/groups/new" };
+const GROUP_PATH = /^\/groups\/([0-9a-f-]{36})\/?$/i;
+// The group whose details page is open; the chat behind it stays selected.
+let pageGroupId: string | null = null;
+let groupNameDraft: string | null = null;
+let groupPageNote: { text: string; error: boolean } | null = null;
+let addDraft = new Set<string>();
+let blockedIds = new Set<string>();
 let groupDraft = { title: "", selected: new Set<string>(), error: "" };
 let devLink = "";
 let draftText = "";
@@ -244,7 +251,13 @@ async function verify(token: string): Promise<void> {
 }
 
 async function showApp(): Promise<void> {
-  page = pageFromPath(location.pathname);
+  const route = pageFromPath(location.pathname);
+  page = route?.page ?? null;
+  if (route?.groupId) {
+    pageGroupId = route.groupId;
+    activeId = route.groupId;
+  }
+  void loadBlocks();
   renderShell();
   connect();
   document.addEventListener("visibilitychange", () => {
@@ -457,23 +470,39 @@ function renderShell(): void {
   paintThread();
 }
 
-function pageFromPath(path: string): Page | null {
-  const match = (Object.entries(PAGE_PATHS) as Array<[Page, string]>).find(([, pagePath]) => pagePath === path);
-  return match?.[0] ?? null;
+function pageFromPath(path: string): { page: Page; groupId?: string } | null {
+  const match = (Object.entries(PAGE_PATHS) as Array<[Exclude<Page, "group">, string]>).find(([, pagePath]) => pagePath === path);
+  if (match) return { page: match[0] };
+  const group = GROUP_PATH.exec(path)?.[1];
+  return group ? { page: "group", groupId: group.toLowerCase() } : null;
 }
 
-function openPage(next: Page): void {
-  if (location.pathname !== PAGE_PATHS[next]) history.pushState({ view: next }, "", PAGE_PATHS[next]);
-  showPage(next);
+function pathFor(next: Page, groupId?: string | null): string {
+  return next === "group" ? `/groups/${groupId}` : PAGE_PATHS[next];
 }
 
-function showPage(next: Page): void {
+function openPage(next: Page, groupId?: string): void {
+  const path = pathFor(next, groupId);
+  if (location.pathname !== path) history.pushState({ view: next, groupId }, "", path);
+  showPage(next, groupId);
+}
+
+function showPage(next: Page, groupId?: string): void {
   page = next;
   accountError = "";
   accountDraft = null;
   accountSaved = false;
   if (next === "new-group") groupDraft = { title: "", selected: new Set(), error: "" };
-  activeId = null;
+  if (next === "group" && groupId) {
+    pageGroupId = groupId;
+    activeId = groupId;
+    groupNameDraft = null;
+    groupPageNote = null;
+    addDraft = new Set();
+  } else {
+    pageGroupId = null;
+    activeId = null;
+  }
   openReactionId = null;
   closeViewer();
   renderShell();
@@ -491,20 +520,38 @@ function closePage(): void {
 
 function hidePage(): void {
   if (!page) return;
+  const backToGroup = page === "group" ? pageGroupId : null;
   page = null;
+  pageGroupId = null;
   accountError = "";
   accountDraft = null;
   accountSaved = false;
   renderShell();
+  // Closing a group's details returns to its chat.
+  if (backToGroup && conversations.some((item) => item.id === backToGroup)) void openConversation(backToGroup);
+}
+
+/** Redraws the open page with fresh data (drafts live in state, so nothing typed is lost). */
+function repaintPage(): void {
+  document.querySelector("#thread")?.removeAttribute("data-view");
+  paintThread();
 }
 
 function bindRoutes(): void {
   window.addEventListener("popstate", () => {
     if (!me) return;
-    const next = pageFromPath(location.pathname);
-    if (next) showPage(next);
+    const route = pageFromPath(location.pathname);
+    if (route) showPage(route.page, route.groupId);
     else hidePage();
   });
+}
+
+async function loadBlocks(): Promise<void> {
+  const result = await api<{ blocks: Array<{ id: string }> }>("/api/blocks");
+  if (!result.ok) return;
+  blockedIds = new Set(result.data.blocks.map((block) => block.id));
+  paintList();
+  if (activeId && !page) paintThread();
 }
 
 const MAX_GROUP_PEOPLE = 25;
@@ -612,6 +659,214 @@ function renderNewGroupPage(thread: Element): void {
     await openConversation(result.data.conversation.id);
   });
   body.append(form);
+  thread.replaceChildren(head, body);
+}
+
+const ROLE_LABEL: Record<string, string> = { owner: "Owner", admin: "Admin" };
+
+function pageNote(text: string, error = false): void {
+  groupPageNote = { text, error };
+  repaintPage();
+}
+
+async function groupAction<T>(path: string, options: { method: string; body?: unknown }, success?: string): Promise<T | null> {
+  const result = await api<T & { conversation?: ConversationDto }>(path, options);
+  if (!result.ok) {
+    pageNote(result.message, true);
+    return null;
+  }
+  if (result.data.conversation) upsertConversation(result.data.conversation);
+  groupPageNote = success ? { text: success, error: false } : null;
+  repaintPage();
+  paintList();
+  return result.data;
+}
+
+function renderGroupPage(thread: Element): void {
+  thread.setAttribute("data-view", "group");
+  thread.removeAttribute("data-conversation-id");
+  const conversation = conversations.find((item) => item.id === pageGroupId);
+  const head = el("div", "thread-head");
+  const back = el("button", "ghost", "Back") as HTMLButtonElement;
+  back.type = "button";
+  back.addEventListener("click", () => closePage());
+  const heading = el("div");
+  heading.append(el("h2", "", "Group details"));
+  heading.append(el("div", "presence", conversation ? conversationName(conversation) : ""));
+  head.append(back, heading, el("span", "head-spacer"));
+  const body = el("div", "account-page");
+  if (!conversation) {
+    body.append(el("p", "empty", "Loading…"));
+    thread.replaceChildren(head, body);
+    return;
+  }
+  const groupId = conversation.id;
+  const myRole = conversation.members.find((member) => member.id === me?.id)?.role ?? "member";
+  const manager = myRole === "owner" || myRole === "admin";
+  const wrap = el("div", "account-form group-details");
+  if (groupPageNote) wrap.append(el("p", groupPageNote.error ? "banner" : "account-saved", groupPageNote.text));
+
+  // Name
+  const nameForm = document.createElement("form");
+  nameForm.className = "detail-section";
+  if (manager) {
+    const name = field("Group name", "text", "No name: members' names are shown");
+    name.input.maxLength = 60;
+    name.input.value = groupNameDraft ?? conversation.title ?? "";
+    name.input.addEventListener("input", () => {
+      groupNameDraft = name.input.value;
+    });
+    const save = el("button", "primary", "Save name") as HTMLButtonElement;
+    save.type = "submit";
+    const row = el("div", "row");
+    row.append(save);
+    nameForm.append(name.label, row);
+    nameForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const saved = await groupAction(`/api/groups/${groupId}`, { method: "PATCH", body: { title: name.input.value } }, "Name saved.");
+      if (saved) groupNameDraft = null;
+    });
+  } else {
+    nameForm.append(el("p", "group-heading", "Group name"), el("p", "meta", conversation.title ?? "No name yet. Only admins can name the group."));
+  }
+  wrap.append(nameForm);
+
+  // People
+  const people = el("section", "detail-section");
+  people.append(el("p", "group-heading", `People · ${conversation.members.length} of ${MAX_GROUP_PEOPLE}`));
+  const list = el("div", "member-picker");
+  const sorted = [...conversation.members].sort((left, right) => {
+    const rank = (role: string) => (role === "owner" ? 0 : role === "admin" ? 1 : 2);
+    return rank(left.role) - rank(right.role) || left.displayName.localeCompare(right.displayName);
+  });
+  for (const member of sorted) {
+    const row = el("div", "member-option member-row");
+    const who = el("span", "member-who");
+    const isMe = member.id === me?.id;
+    who.append(el("strong", "", isMe ? `${member.displayName} (you)` : member.displayName), el("span", "meta", `@${member.username}`));
+    row.append(who);
+    if (ROLE_LABEL[member.role]) row.append(el("span", "role-badge", ROLE_LABEL[member.role]));
+    const actions = el("div", "row member-actions");
+    if (!isMe && myRole === "owner" && member.role !== "owner") {
+      const toggle = el("button", "ghost small", member.role === "admin" ? "Remove admin" : "Make admin") as HTMLButtonElement;
+      toggle.type = "button";
+      toggle.addEventListener("click", () => {
+        void groupAction(`/api/groups/${groupId}/members/${member.id}/role`, {
+          method: "PUT",
+          body: { role: member.role === "admin" ? "member" : "admin" },
+        });
+      });
+      actions.append(toggle);
+    }
+    if (!isMe && (myRole === "owner" || (myRole === "admin" && member.role === "member"))) {
+      const remove = el("button", "ghost small danger", "Remove") as HTMLButtonElement;
+      remove.type = "button";
+      remove.addEventListener("click", () => {
+        if (!window.confirm(`Remove ${member.displayName} from the group?`)) return;
+        void groupAction(`/api/groups/${groupId}/members/${member.id}`, { method: "DELETE" });
+      });
+      actions.append(remove);
+    }
+    if (actions.childElementCount > 0) row.append(actions);
+    list.append(row);
+  }
+  people.append(list);
+  wrap.append(people);
+
+  // Add people
+  if (manager) {
+    const add = el("section", "detail-section");
+    add.append(el("p", "group-heading", "Add people"));
+    const inGroup = new Set(conversation.members.map((member) => member.id));
+    const candidates = groupContacts().filter((contact) => !inGroup.has(contact.id));
+    const room = MAX_GROUP_PEOPLE - conversation.members.length;
+    if (room <= 0) {
+      add.append(el("p", "meta", `The group is full (${MAX_GROUP_PEOPLE} people).`));
+    } else if (candidates.length === 0) {
+      add.append(el("p", "meta", "Everyone you chat with is already here. Share the invite link to bring in others."));
+    } else {
+      const picker = el("div", "member-picker");
+      for (const contact of candidates) {
+        const option = document.createElement("label");
+        option.className = "member-option";
+        const box = document.createElement("input");
+        box.type = "checkbox";
+        box.checked = addDraft.has(contact.id);
+        box.addEventListener("change", () => {
+          if (box.checked && addDraft.size >= room) {
+            box.checked = false;
+            return;
+          }
+          if (box.checked) addDraft.add(contact.id);
+          else addDraft.delete(contact.id);
+          addButton.disabled = addDraft.size === 0;
+        });
+        const who = el("span", "member-who");
+        who.append(el("strong", "", contact.displayName), el("span", "meta", `@${contact.username}`));
+        option.append(box, who);
+        picker.append(option);
+      }
+      const addButton = el("button", "primary", "Add to group") as HTMLButtonElement;
+      addButton.type = "button";
+      addButton.disabled = addDraft.size === 0;
+      addButton.addEventListener("click", async () => {
+        const added = await groupAction(`/api/groups/${groupId}/members`, { method: "POST", body: { memberIds: [...addDraft] } }, "Added.");
+        if (added) {
+          addDraft = new Set();
+          repaintPage();
+        }
+      });
+      const row = el("div", "row");
+      row.append(addButton);
+      add.append(el("p", "meta account-hint", `You can add people you already have a chat with. Room for ${room} more.`), picker, row);
+    }
+    wrap.append(add);
+  }
+
+  // Invite link
+  const invite = el("section", "detail-section");
+  invite.append(el("p", "group-heading", "Group invite link"));
+  if (manager) {
+    invite.append(el("p", "meta account-hint", "Anyone with it can join. They'll see messages from when they join."));
+    const copy = el("button", "ghost", "Copy link") as HTMLButtonElement;
+    copy.type = "button";
+    copy.addEventListener("click", async () => {
+      const result = await api<{ token: string }>(`/api/groups/${groupId}/invite`);
+      if (!result.ok || !(await writeClipboard(inviteUrl(result.data.token)))) {
+        pageNote(result.ok ? "The invite link could not be copied." : result.message, true);
+        return;
+      }
+      copy.textContent = "Copied";
+      window.setTimeout(() => {
+        if (copy.isConnected) copy.textContent = "Copy link";
+      }, 2000);
+    });
+    const reset = el("button", "ghost", "Reset") as HTMLButtonElement;
+    reset.type = "button";
+    reset.addEventListener("click", async () => {
+      if (!window.confirm("Reset the group's invite link? The old link will stop working.")) return;
+      await groupAction(`/api/groups/${groupId}/invite/reset`, { method: "POST" }, "Invite link reset. Copy the new one to share it.");
+    });
+    const row = el("div", "row");
+    row.append(copy, reset);
+    invite.append(row);
+  } else {
+    invite.append(el("p", "meta", "Ask the owner or an admin for the group's invite link."));
+  }
+  wrap.append(invite);
+
+  // Leave
+  const leave = el("section", "detail-section");
+  const leaveButton = el("button", "ghost danger", "Leave group") as HTMLButtonElement;
+  leaveButton.type = "button";
+  leaveButton.addEventListener("click", () => void leaveConversation(conversation));
+  leave.append(leaveButton);
+  if (myRole === "owner" && conversation.members.length > 1) {
+    leave.append(el("p", "meta account-hint", "If you leave, the longest-standing member becomes the owner."));
+  }
+  wrap.append(leave);
+
+  body.append(wrap);
   thread.replaceChildren(head, body);
 }
 
@@ -749,13 +1004,18 @@ function conversationName(conversation: ConversationDto): string {
 
 function memberName(conversation: ConversationDto, userId: string): string {
   if (userId === me?.id) return "You";
-  return conversation.members.find((member) => member.id === userId)?.displayName ?? "Former member";
+  return (
+    conversation.members.find((member) => member.id === userId)?.displayName ??
+    conversation.formerMembers.find((member) => member.id === userId)?.displayName ??
+    "Former member"
+  );
 }
 
 function previewText(conversation: ConversationDto): string {
   const text = conversation.lastMessagePreview;
   if (!text) return conversation.type === "group" ? "No messages yet. Say hi to the group." : "No messages yet";
-  if (conversation.type !== "group" || !conversation.lastMessageSenderId) return text;
+  if (conversation.type !== "group" || !conversation.lastMessageSenderId || conversation.lastMessageKind === "system") return text;
+  if (blockedIds.has(conversation.lastMessageSenderId)) return "Message from someone you blocked";
   const name = memberName(conversation, conversation.lastMessageSenderId);
   return `${name === "You" ? "You" : name.split(" ")[0]}: ${text}`;
 }
@@ -764,7 +1024,9 @@ function previewText(conversation: ConversationDto): string {
 function lastOwnSentSeq(): number | null {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (message && message.senderId === me?.id && !message.pending && !message.failed && !message.deletedAt) return message.seq;
+    if (message && message.kind !== "system" && message.senderId === me?.id && !message.pending && !message.failed && !message.deletedAt) {
+      return message.seq;
+    }
   }
   return null;
 }
@@ -804,6 +1066,13 @@ async function leaveConversation(conversation: ConversationDto): Promise<void> {
   conversations = conversations.filter((item) => item.id !== conversation.id);
   activeId = null;
   messages = [];
+  if (page === "group") {
+    page = null;
+    pageGroupId = null;
+    if (pageFromPath(location.pathname)) history.replaceState(null, "", "/");
+    renderShell();
+    return;
+  }
   document.querySelector(".shell")?.classList.remove("thread-open");
   paintList();
   paintThread();
@@ -821,7 +1090,8 @@ function paintThread(): void {
     // Live updates repaint the thread often; leave the page (and anything typed) alone.
     if (thread.getAttribute("data-view") !== page) {
       if (page === "account") renderAccountPage(thread);
-      else renderNewGroupPage(thread);
+      else if (page === "new-group") renderNewGroupPage(thread);
+      else renderGroupPage(thread);
     }
     return;
   }
@@ -865,11 +1135,11 @@ function paintThread(): void {
     roster.title = ["You", ...otherMembers(conversation).map((member) => member.displayName)].join(", ");
     title.append(roster);
   }
-  const action = el("button", "ghost", peer ? "Block" : "Leave") as HTMLButtonElement;
+  const action = el("button", "ghost", peer ? "Block" : "Details") as HTMLButtonElement;
   action.type = "button";
   action.addEventListener("click", async () => {
     if (!peer) {
-      await leaveConversation(conversation);
+      openPage("group", conversation.id);
       return;
     }
     const result = await api("/api/blocks", { method: "POST", body: { username: peer.username } });
@@ -879,6 +1149,7 @@ function paintThread(): void {
       return;
     }
     banner = `${peer.displayName} is blocked.`;
+    blockedIds.add(peer.id);
     paintThread();
   });
   head.append(back, title, action);
@@ -890,6 +1161,23 @@ function paintThread(): void {
   if (banner) scroller.append(el("p", "banner", banner));
   if (messages.length === 0) scroller.append(el("p", "empty", "Say hello."));
   for (const message of messages) {
+    if (message.kind === "system") {
+      const line = el("div", "system-line");
+      line.dataset.messageId = message.id;
+      line.append(el("span", "", message.body), el("small", "", formatTime(message.createdAt)));
+      scroller.append(line);
+      previousSender = null;
+      continue;
+    }
+    if (isGroup && message.senderId !== me?.id && blockedIds.has(message.senderId)) {
+      // In a shared group you still see that someone you blocked said something, but not what.
+      const hidden = el("div", "bubble hidden-message");
+      hidden.dataset.messageId = message.id;
+      hidden.append(el("span", "deleted-note", "Message from someone you blocked"), el("small", "", formatTime(message.createdAt)));
+      scroller.append(hidden);
+      previousSender = null;
+      continue;
+    }
     if (isGroup && message.senderId !== me?.id && message.senderId !== previousSender) {
       scroller.append(el("div", "sender-name", memberName(conversation, message.senderId)));
     }
@@ -1102,6 +1390,14 @@ async function refresh(): Promise<void> {
     document.querySelector("#thread")?.removeAttribute("data-view");
     paintThread();
   }
+  if (page === "group" && pageGroupId && !conversations.some((item) => item.id === pageGroupId)) {
+    page = null;
+    pageGroupId = null;
+    if (pageFromPath(location.pathname)) history.replaceState(null, "", "/");
+    renderShell();
+  } else if (page === "group") {
+    repaintPage();
+  }
   if (activeId && !conversations.some((item) => item.id === activeId)) {
     // You left (or were removed from) the open chat.
     activeId = null;
@@ -1110,7 +1406,7 @@ async function refresh(): Promise<void> {
     paintThread();
   }
   paintList();
-  if (activeId) await reloadActive();
+  if (activeId && page !== "group") await reloadActive();
 }
 
 async function openConversation(id: string): Promise<void> {
@@ -1665,6 +1961,7 @@ async function sendMessage(body: string, files: File[], previews: string[]): Pro
     seq: (messages.at(-1)?.seq ?? 0) + 1,
     body,
     createdAt: Date.now(),
+    kind: "text",
     deletedAt: null,
     attachments: [],
     reactions: [],
@@ -1714,9 +2011,10 @@ function replaceMessage(message: MessageDto): void {
   const isNew = message.seq > conversation.lastMessageSeq;
   conversation.lastMessagePreview = message.body.trim() ? message.body.slice(0, 140) : "Photo";
   conversation.lastMessageSenderId = message.senderId;
+  conversation.lastMessageKind = message.kind;
   conversation.lastMessageAt = message.createdAt;
   if (isNew) conversation.lastMessageSeq = message.seq;
-  if (isNew && message.senderId !== me?.id && activeId !== message.conversationId) {
+  if (isNew && message.kind === "text" && message.senderId !== me?.id && activeId !== message.conversationId) {
     conversation.unreadCount += 1;
   }
 }
