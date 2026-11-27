@@ -18,6 +18,13 @@ let loadingOlder = false;
 let socket: WebSocket | null = null;
 let retryMs = 500;
 let typingTimer = 0;
+let typingSentAt = 0;
+let typingSentActive = false;
+let peerTypingTimer = 0;
+// While someone keeps typing, say so at most this often; everyone else's hub hears each update.
+const TYPING_RESEND_MS = 3000;
+// If a "stopped typing" update is lost, hide the indicator after this long anyway.
+const TYPING_EXPIRE_MS = 6000;
 let peerTyping = false;
 let banner = "";
 let mode: "login" | "register" = "login";
@@ -867,6 +874,8 @@ async function refresh(): Promise<void> {
 }
 
 async function openConversation(id: string): Promise<void> {
+  typingSentActive = false;
+  typingSentAt = 0;
   if (accountOpen) {
     accountOpen = false;
     if (location.pathname === ACCOUNT_PATH) history.replaceState(null, "", "/");
@@ -1532,9 +1541,10 @@ function handleEvent(event: HubEvent): void {
   if (event.type === "read") {
     const conversation = conversations.find((item) => item.id === event.conversationId);
     if (!conversation) return;
-    if (event.userId === conversation.peer.id) conversation.peerLastReadSeq = event.lastReadSeq;
+    // Read positions only move forward; ignore an older one that arrives late.
+    if (event.userId === conversation.peer.id) conversation.peerLastReadSeq = Math.max(conversation.peerLastReadSeq, event.lastReadSeq);
     if (event.userId === me?.id) {
-      conversation.lastReadSeq = event.lastReadSeq;
+      conversation.lastReadSeq = Math.max(conversation.lastReadSeq, event.lastReadSeq);
       conversation.unreadCount = 0;
     }
     paintList();
@@ -1543,6 +1553,12 @@ function handleEvent(event: HubEvent): void {
   }
   if (event.type === "typing" && event.conversationId === activeId && event.userId !== me?.id) {
     peerTyping = event.active;
+    window.clearTimeout(peerTypingTimer);
+    if (event.active) {
+      peerTypingTimer = window.setTimeout(() => {
+        handleEvent({ type: "typing", conversationId: event.conversationId, userId: event.userId, active: false });
+      }, TYPING_EXPIRE_MS);
+    }
     const caret = captureComposerCaret();
     const node = document.querySelector(".typing");
     const conversation = conversations.find((item) => item.id === activeId);
@@ -1581,9 +1597,14 @@ function handleEvent(event: HubEvent): void {
 
 function sendTyping(active: boolean): void {
   if (!activeId || socket?.readyState !== WebSocket.OPEN) return;
-  socket.send(JSON.stringify({ type: "typing", conversationId: activeId, active }));
   window.clearTimeout(typingTimer);
   if (active) typingTimer = window.setTimeout(() => sendTyping(false), 2000);
+  const now = Date.now();
+  // Skip repeats: only send a change, or a "still typing" refresh every few seconds.
+  if (active === typingSentActive && (!active || now - typingSentAt < TYPING_RESEND_MS)) return;
+  typingSentActive = active;
+  typingSentAt = now;
+  socket.send(JSON.stringify({ type: "typing", conversationId: activeId, active }));
 }
 
 async function api<T>(path: string, options: { method?: string; body?: unknown } = {}): Promise<

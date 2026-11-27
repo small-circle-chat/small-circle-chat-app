@@ -48,18 +48,17 @@ export class UserHub extends DurableObject<Env> {
     const attachment = ws.deserializeAttachment() as Attachment | null;
     if (!attachment?.userId) return;
 
-    const membership = await this.env.DB.prepare(
-      `SELECT 1 AS ok FROM conversation_members WHERE conversation_id = ? AND user_id = ?`,
-    )
-      .bind(body.conversationId, attachment.userId)
-      .first();
-    if (!membership) return;
-
+    // One query: the other members, but only if the sender is a member too.
     const peers = await this.env.DB.prepare(
-      `SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id != ?`,
+      `SELECT other.user_id
+       FROM conversation_members me
+       JOIN conversation_members other
+         ON other.conversation_id = me.conversation_id AND other.user_id != me.user_id
+       WHERE me.conversation_id = ? AND me.user_id = ?`,
     )
       .bind(body.conversationId, attachment.userId)
       .all<{ user_id: string }>();
+    if (peers.results.length === 0) return;
 
     await fanOut(this.env, peers.results.map((row) => row.user_id), {
       type: "typing",

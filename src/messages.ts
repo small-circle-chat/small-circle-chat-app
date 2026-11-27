@@ -16,35 +16,38 @@ export async function insertMessage(
 
   const id = crypto.randomUUID();
   const createdAt = Date.now();
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const result = await db
+  try {
+    // One transaction: bump the conversation's counter, then insert with the new number.
+    // If the insert fails (a duplicate send), the counter bump rolls back with it.
+    // MAX(...) keeps the counter ahead of any rows written without it.
+    await db.batch([
+      db
+        .prepare(
+          `UPDATE conversations
+           SET seq_counter = MAX(seq_counter, COALESCE((SELECT MAX(seq) FROM messages WHERE conversation_id = ?1), 0)) + 1
+           WHERE id = ?1`,
+        )
+        .bind(input.conversationId),
+      db
         .prepare(
           `INSERT INTO messages (id, conversation_id, sender_id, client_msg_id, seq, body, created_at)
-           SELECT ?1, ?2, ?3, ?4,
-                  COALESCE((SELECT MAX(seq) FROM messages WHERE conversation_id = ?2), 0) + 1,
-                  ?5, ?6`,
+           SELECT ?1, ?2, ?3, ?4, seq_counter, ?5, ?6 FROM conversations WHERE id = ?2`,
         )
-        .bind(id, input.conversationId, input.senderId, input.clientMsgId, input.body, createdAt)
-        .run();
-      if (result.meta.changes < 1) throw new Error("Message insert did not write a row");
-      const row = await db.prepare(`SELECT * FROM messages WHERE id = ?`).bind(id).first<MessageRow>();
-      if (!row) throw new Error("Inserted message could not be read");
-      return { message: toMessage(row, []), replay: false };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "";
-      if (message.includes("client_msg_id")) {
-        const raced = await db
-          .prepare(`SELECT * FROM messages WHERE conversation_id = ? AND client_msg_id = ?`)
-          .bind(input.conversationId, input.clientMsgId)
-          .first<MessageRow>();
-        if (raced) return { message: await hydrateMessage(db, raced), replay: true };
-      }
-      if (!message.includes("messages.seq") || attempt === 1) throw error;
-    }
+        .bind(id, input.conversationId, input.senderId, input.clientMsgId, input.body, createdAt),
+    ]);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    if (!message.includes("client_msg_id")) throw error;
+    const raced = await db
+      .prepare(`SELECT * FROM messages WHERE conversation_id = ? AND client_msg_id = ?`)
+      .bind(input.conversationId, input.clientMsgId)
+      .first<MessageRow>();
+    if (!raced) throw error;
+    return { message: await hydrateMessage(db, raced), replay: true };
   }
-
-  throw new Error("Message insert failed");
+  const row = await db.prepare(`SELECT * FROM messages WHERE id = ?`).bind(id).first<MessageRow>();
+  if (!row) throw new Error("Inserted message could not be read");
+  return { message: toMessage(row, []), replay: false };
 }
 
 export async function publishMessage(env: Env, conversationId: string, message: MessageDto): Promise<void> {

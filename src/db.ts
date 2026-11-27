@@ -1,4 +1,4 @@
-import type { AttachmentDto, MessageDto, Peer, PublicUser, ReactionGroup } from "../shared/events";
+import type { AttachmentDto, MemberDto, MessageDto, Peer, PublicUser, ReactionGroup } from "../shared/events";
 
 export const SESSION_COOKIE = "__Host-session";
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -154,6 +154,9 @@ export function tombstoneUsername(userId: string): string {
 
 export type ConversationRecord = {
   id: string;
+  type: "direct" | "group";
+  title: string | null;
+  members: MemberDto[];
   unreadCount: number;
   lastReadSeq: number;
   peerLastReadSeq: number;
@@ -165,6 +168,8 @@ export type ConversationRecord = {
 
 type ConversationJoinRow = {
   id: string;
+  type: "direct" | "group";
+  title: string | null;
   unread_count: number;
   last_read_seq: number;
   peer_last_read_seq: number;
@@ -177,9 +182,12 @@ type ConversationJoinRow = {
   peer_deleted_at: number | null;
 };
 
-export function toConversation(row: ConversationJoinRow): ConversationRecord {
+export function toConversation(row: ConversationJoinRow, members: MemberDto[] = []): ConversationRecord {
   return {
     id: row.id,
+    type: row.type,
+    title: row.title,
+    members,
     unreadCount: row.unread_count,
     lastReadSeq: row.last_read_seq,
     peerLastReadSeq: row.peer_last_read_seq,
@@ -197,6 +205,8 @@ export function toConversation(row: ConversationJoinRow): ConversationRecord {
 
 const conversationSelect = `
   SELECT c.id,
+         c.type,
+         c.title,
          me.unread_count,
          me.last_read_seq,
          other.last_read_seq AS peer_last_read_seq,
@@ -224,7 +234,46 @@ export async function listConversations(db: D1Database, userId: string): Promise
     )
     .bind(userId)
     .all<ConversationJoinRow>();
-  return result.results.map(toConversation);
+  const members = await membersFor(db, result.results.map((row) => row.id));
+  return result.results.map((row) => toConversation(row, members.get(row.id) ?? []));
+}
+
+/** Members of several conversations in one query, oldest member first. */
+export async function membersFor(db: D1Database, conversationIds: string[]): Promise<Map<string, MemberDto[]>> {
+  const grouped = new Map<string, MemberDto[]>();
+  if (conversationIds.length === 0) return grouped;
+  const placeholders = conversationIds.map(() => "?").join(", ");
+  const result = await db
+    .prepare(
+      `SELECT cm.conversation_id, cm.role, cm.last_read_seq, u.id, u.username, u.display_name, u.deleted_at
+       FROM conversation_members cm
+       JOIN users u ON u.id = cm.user_id
+       WHERE cm.conversation_id IN (${placeholders})
+       ORDER BY cm.joined_at ASC, u.id ASC`,
+    )
+    .bind(...conversationIds)
+    .all<{
+      conversation_id: string;
+      role: string;
+      last_read_seq: number;
+      id: string;
+      username: string;
+      display_name: string;
+      deleted_at: number | null;
+    }>();
+  for (const row of result.results) {
+    const list = grouped.get(row.conversation_id) ?? [];
+    list.push({
+      id: row.id,
+      username: row.username,
+      displayName: row.deleted_at ? "Deleted user" : row.display_name,
+      deleted: row.deleted_at !== null,
+      role: row.role,
+      lastReadSeq: row.last_read_seq,
+    });
+    grouped.set(row.conversation_id, list);
+  }
+  return grouped;
 }
 
 export async function getConversation(
@@ -236,5 +285,7 @@ export async function getConversation(
     .prepare(`${conversationSelect} WHERE me.user_id = ? AND c.id = ? AND c.type = 'direct'`)
     .bind(userId, conversationId)
     .first<ConversationJoinRow>();
-  return row ? toConversation(row) : null;
+  if (!row) return null;
+  const members = await membersFor(db, [row.id]);
+  return toConversation(row, members.get(row.id) ?? []);
 }
