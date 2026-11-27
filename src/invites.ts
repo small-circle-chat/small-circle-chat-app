@@ -1,5 +1,6 @@
-import type { ChatRequestDto } from "../shared/events";
+import type { ChatRequestDto, MessageDto } from "../shared/events";
 import { isBlocked, pairKey, randomToken } from "./db";
+import { joinWithGroupInvite } from "./groups";
 
 export const DAILY_REQUEST_ATTEMPTS = 20;
 export const DECLINE_COOLDOWN_MS = 30 * 24 * 60 * 60 * 1000;
@@ -205,7 +206,9 @@ export async function resetInviteToken(db: D1Database, userId: string): Promise<
 export type RedeemOutcome =
   | { kind: "invalid" }
   | { kind: "own" }
-  | { kind: "opened"; conversationId: string; ownerId: string; created: boolean };
+  | { kind: "full" }
+  | { kind: "opened"; conversationId: string; ownerId: string; created: boolean }
+  | { kind: "joined"; conversationId: string; created: boolean; system: MessageDto | null };
 
 export async function redeemInvite(db: D1Database, userId: string, token: string): Promise<RedeemOutcome> {
   const owner = await db
@@ -215,7 +218,10 @@ export async function redeemInvite(db: D1Database, userId: string, token: string
     )
     .bind(token)
     .first<{ user_id: string }>();
-  if (!owner) return { kind: "invalid" };
+  if (!owner) {
+    // Not a person's link; it may be a group's.
+    return joinWithGroupInvite(db, userId, token);
+  }
   if (owner.user_id === userId) return { kind: "own" };
   if (await isBlocked(db, userId, owner.user_id)) return { kind: "invalid" };
   const opened = await openDirectConversation(db, userId, owner.user_id);

@@ -1,5 +1,5 @@
 import { Hono, type Context } from "hono";
-import type { ConversationDto } from "../shared/events";
+import type { ConversationDto, MessageDto } from "../shared/events";
 import {
   LOGIN_COOLDOWN_MS,
   LOGIN_TOKEN_TTL_MS,
@@ -9,6 +9,7 @@ import {
   findUserBySession,
   getConversation,
   isBlocked,
+  MAX_GROUP_MEMBERS,
   memberIds,
   listConversations,
   randomToken,
@@ -30,6 +31,17 @@ import {
 } from "./attachments";
 import { cleanupAbandonedAttachments } from "./cleanup";
 import {
+  addMembers,
+  createGroup,
+  groupInviteToken,
+  groupMemberIds,
+  leaveGroup,
+  removeMember,
+  renameGroup,
+  setMemberRole,
+  type ManageOutcome,
+} from "./groups";
+import {
   inviteToken,
   listIncomingRequests,
   pruneRequestRecords,
@@ -48,7 +60,9 @@ import {
   normalizeClientMessageId,
   normalizeDisplayName,
   normalizeEmail,
+  normalizeGroupTitle,
   normalizeInviteToken,
+  normalizeMemberIds,
   normalizeMessageBody,
   normalizeReactionEmoji,
   normalizeUsername,
@@ -259,16 +273,16 @@ app.delete("/api/me", async (c) => {
 app.get("/api/blocks", async (c) => {
   const user = c.get("user");
   const result = await c.env.DB.prepare(
-    `SELECT u.username, u.display_name
+    `SELECT u.id, u.username, u.display_name
      FROM blocks b
      JOIN users u ON u.id = b.blocked_id
      WHERE b.blocker_id = ?
      ORDER BY u.username`,
   )
     .bind(user.id)
-    .all<{ username: string; display_name: string }>();
+    .all<{ id: string; username: string; display_name: string }>();
   return c.json({
-    blocks: result.results.map((row) => ({ username: row.username, displayName: row.display_name })),
+    blocks: result.results.map((row) => ({ id: row.id, username: row.username, displayName: row.display_name })),
   });
 });
 
@@ -384,10 +398,116 @@ app.post("/api/invite/redeem", async (c) => {
   const outcome = token ? await redeemInvite(c.env.DB, user.id, token) : ({ kind: "invalid" } as const);
   if (outcome.kind === "invalid") return error(c, 404, "invalid_invite", "This invite link is no longer valid. Ask for a new one.");
   if (outcome.kind === "own") return error(c, 400, "own_invite", "That's your own invite link. Send it to someone you want to chat with.");
+  if (outcome.kind === "full") return error(c, 409, "group_full", "That group is full. Groups can have up to 25 people.");
+  if (outcome.kind === "joined") {
+    if (outcome.system) announce(c, outcome.conversationId, outcome.system, []);
+    return conversationResponse(c, outcome.conversationId, outcome.created ? 201 : 200);
+  }
   if (outcome.created) {
     background(c, "conversation_opened", fanOut(c.env, [outcome.ownerId], { type: "conversation_opened", conversationId: outcome.conversationId }));
   }
   return conversationResponse(c, outcome.conversationId, outcome.created ? 201 : 200);
+});
+
+app.post("/api/groups", async (c) => {
+  if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
+  const user = c.get("user");
+  if (!(await allow(c.env.LOOKUP_RATE_LIMITER, `group:${user.id}`))) {
+    return error(c, 429, "rate_limited", "Too many requests. Wait a minute and try again.");
+  }
+  const body = await readJson(c);
+  const title = body ? normalizeGroupTitle(body.title) : "invalid";
+  if (title === "invalid") return error(c, 400, "invalid_input", "Group names can be up to 60 characters.");
+  const memberIds = body ? normalizeMemberIds(body.memberIds, MAX_GROUP_MEMBERS) : null;
+  if (!memberIds) return error(c, 400, "invalid_input", `Choose up to ${MAX_GROUP_MEMBERS - 1} people.`);
+
+  const outcome = await createGroup(c.env.DB, user.id, title, memberIds);
+  if (outcome.kind === "too_few") return error(c, 400, "invalid_input", "Choose at least 2 people for a group.");
+  if (outcome.kind === "too_many") {
+    return error(c, 400, "invalid_input", `Groups can have up to ${MAX_GROUP_MEMBERS} people, including you.`);
+  }
+  if (outcome.kind === "not_allowed") {
+    return error(c, 403, "forbidden", "You can only add people you already have a chat with.");
+  }
+  background(
+    c,
+    "conversation_opened",
+    fanOut(c.env, outcome.memberIds.filter((id) => id !== user.id), { type: "conversation_opened", conversationId: outcome.conversationId }),
+  );
+  return conversationResponse(c, outcome.conversationId, 201);
+});
+
+app.post("/api/conversations/:id/leave", async (c) => {
+  if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
+  const user = c.get("user");
+  const conversation = await requireConversation(c);
+  if (conversation instanceof Response) return conversation;
+  const outcome = await leaveGroup(c.env.DB, conversation.id, user.id);
+  if (outcome.kind === "not_group") return error(c, 400, "invalid_input", "You can only leave group chats.");
+  announce(c, conversation.id, outcome.system, [user.id]);
+  return c.json({ ok: true });
+});
+
+app.patch("/api/groups/:id", async (c) => {
+  if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
+  const conversation = await requireConversation(c);
+  if (conversation instanceof Response) return conversation;
+  const body = await readJson(c);
+  const title = body ? normalizeGroupTitle(body.title) : "invalid";
+  if (title === "invalid") return error(c, 400, "invalid_input", "Group names can be up to 60 characters.");
+  return manageResponse(c, conversation.id, await renameGroup(c.env.DB, conversation.id, c.get("user").id, title));
+});
+
+app.post("/api/groups/:id/members", async (c) => {
+  if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
+  const conversation = await requireConversation(c);
+  if (conversation instanceof Response) return conversation;
+  const body = await readJson(c);
+  const memberIds = body ? normalizeMemberIds(body.memberIds, MAX_GROUP_MEMBERS) : null;
+  if (!memberIds) return error(c, 400, "invalid_input", `Choose up to ${MAX_GROUP_MEMBERS - 1} people.`);
+  return manageResponse(c, conversation.id, await addMembers(c.env.DB, conversation.id, c.get("user").id, memberIds));
+});
+
+app.delete("/api/groups/:id/members/:userId", async (c) => {
+  if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
+  const conversation = await requireConversation(c);
+  if (conversation instanceof Response) return conversation;
+  const target = normalizeUuid(c.req.param("userId"));
+  if (!target) return error(c, 404, "not_found", "That person isn't in this group.");
+  return manageResponse(c, conversation.id, await removeMember(c.env.DB, conversation.id, c.get("user").id, target));
+});
+
+app.put("/api/groups/:id/members/:userId/role", async (c) => {
+  if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
+  const conversation = await requireConversation(c);
+  if (conversation instanceof Response) return conversation;
+  const target = normalizeUuid(c.req.param("userId"));
+  const body = await readJson(c);
+  const role = body?.role;
+  if (!target) return error(c, 404, "not_found", "That person isn't in this group.");
+  if (role !== "admin" && role !== "member") return error(c, 400, "invalid_input", "Choose admin or member.");
+  return manageResponse(c, conversation.id, await setMemberRole(c.env.DB, conversation.id, c.get("user").id, target, role));
+});
+
+app.get("/api/groups/:id/invite", async (c) => {
+  const conversation = await requireConversation(c);
+  if (conversation instanceof Response) return conversation;
+  const token = await groupInviteToken(c.env.DB, conversation.id, c.get("user").id);
+  if (token === "forbidden") return error(c, 403, "forbidden", "Only the group's owner and admins can share its invite link.");
+  return c.json({ token });
+});
+
+app.post("/api/groups/:id/invite/reset", async (c) => {
+  if (!sameOrigin(c.req.raw)) return error(c, 403, "forbidden", "Cross-origin request rejected.");
+  const user = c.get("user");
+  const conversation = await requireConversation(c);
+  if (conversation instanceof Response) return conversation;
+  if (!(await allow(c.env.LOOKUP_RATE_LIMITER, `group-invite-reset:${user.id}`))) {
+    return error(c, 429, "rate_limited", "Too many requests. Wait a minute and try again.");
+  }
+  const token = await groupInviteToken(c.env.DB, conversation.id, user.id, true);
+  if (token === "forbidden") return error(c, 403, "forbidden", "Only the group's owner and admins can reset its invite link.");
+  return c.json({ token });
 });
 
 app.get("/api/conversations/:id", async (c) => {
@@ -407,6 +527,7 @@ app.get("/api/conversations/:id/messages", async (c) => {
   }
   if (before && after) return error(c, 400, "invalid_input", "Choose one sequence cursor.");
   const page = await listMessages(c.env.DB, conversation.id, {
+    fromSeq: conversation.historyFromSeq,
     beforeSeq: before ?? undefined,
     afterSeq: after ?? undefined,
   });
@@ -421,7 +542,7 @@ app.post("/api/conversations/:id/attachments", async (c) => {
   if (!(await allow(c.env.SEND_RATE_LIMITER, `send:${user.id}`))) {
     return error(c, 429, "rate_limited", "Too many messages. Wait a minute and try again.");
   }
-  if (await isBlocked(c.env.DB, user.id, conversation.peer.id)) {
+  if (conversation.peer && (await isBlocked(c.env.DB, user.id, conversation.peer.id))) {
     return error(c, 403, "blocked", "You cannot message this user.");
   }
 
@@ -498,7 +619,7 @@ app.post("/api/conversations/:id/messages", async (c) => {
   if (!(await allow(c.env.SEND_RATE_LIMITER, `send:${user.id}`))) {
     return error(c, 429, "rate_limited", "Too many messages. Wait a minute and try again.");
   }
-  if (await isBlocked(c.env.DB, user.id, conversation.peer.id)) {
+  if (conversation.peer && (await isBlocked(c.env.DB, user.id, conversation.peer.id))) {
     return error(c, 403, "blocked", "You cannot message this user.");
   }
 
@@ -543,7 +664,7 @@ app.put("/api/conversations/:id/messages/:messageId/reaction", async (c) => {
   if (!(await allow(c.env.SEND_RATE_LIMITER, `react:${user.id}`))) {
     return error(c, 429, "rate_limited", "Too many reactions. Wait a minute and try again.");
   }
-  if (await isBlocked(c.env.DB, user.id, conversation.peer.id)) {
+  if (conversation.peer && (await isBlocked(c.env.DB, user.id, conversation.peer.id))) {
     return error(c, 403, "blocked", "You cannot message this user.");
   }
 
@@ -737,6 +858,38 @@ function startSession(c: AppContext, user: UserRow, now: number) {
   });
 }
 
+async function manageResponse(c: AppContext, conversationId: string, outcome: ManageOutcome) {
+  switch (outcome.kind) {
+    case "not_group":
+      return error(c, 400, "invalid_input", "That only works in group chats.");
+    case "forbidden":
+      return error(c, 403, "forbidden", "Only the group's owner and admins can do that.");
+    case "not_allowed":
+      return error(c, 403, "forbidden", "You can only add people you already have a chat with.");
+    case "too_many":
+      return error(c, 409, "group_full", `Groups can have up to ${MAX_GROUP_MEMBERS} people.`);
+    case "not_member":
+      return error(c, 404, "not_found", "That person isn't in this group.");
+    case "nothing":
+      return conversationResponse(c, conversationId, 200);
+    case "done":
+      announce(c, conversationId, outcome.system, outcome.affectedIds);
+      return conversationResponse(c, conversationId, 200);
+  }
+}
+
+/** Shares a system line with the group, and tells everyone involved to refresh the group's details. */
+function announce(c: AppContext, conversationId: string, system: MessageDto, alsoNotify: string[]): void {
+  background(
+    c,
+    "group change",
+    groupMemberIds(c.env.DB, conversationId).then(async (ids) => {
+      await fanOut(c.env, ids, { type: "message", conversationId, message: system });
+      await fanOut(c.env, [...ids, ...alsoNotify], { type: "conversation_updated", conversationId });
+    }),
+  );
+}
+
 async function conversationResponse(c: AppContext, conversationId: string, status: 200 | 201) {
   const conversation = await getConversation(c.env.DB, c.get("user").id, conversationId);
   if (!conversation) return error(c, 500, "missing_conversation", "The conversation could not be opened.");
@@ -771,6 +924,8 @@ async function withPresence(
     const statuses = await Promise.all(
       chunk.map(async (conversation) => {
         try {
+          // Groups don't show online status, which saves a lookup per member.
+          if (!conversation.peer) return { online: false };
           return await env.USER_HUB.getByName(conversation.peer.id).presence();
         } catch (error) {
           console.error("presence lookup failed", error);

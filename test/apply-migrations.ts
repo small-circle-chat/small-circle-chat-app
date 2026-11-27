@@ -5,6 +5,7 @@ import reactions from "../migrations/0003_reactions.sql?raw";
 import messageDeletion from "../migrations/0004_message_deletion.sql?raw";
 import chatRequests from "../migrations/0005_chat_requests.sql?raw";
 import messageCounter from "../migrations/0006_message_counter.sql?raw";
+import runningGroups from "../migrations/0007_running_groups.sql?raw";
 
 // D1 exec treats a newline as the end of a statement, so each script is flattened.
 await env.DB.exec(schema.replace(/\s+/g, " "));
@@ -13,3 +14,4 @@ await env.DB.exec(reactions.replace(/\s+/g, " "));
 await env.DB.exec(messageDeletion.replace(/\s+/g, " "));
 await env.DB.exec(chatRequests.replace(/--[^\n]*/g, "").replace(/\s+/g, " "));
 await env.DB.exec(messageCounter.replace(/--[^\n]*/g, "").replace(/\s+/g, " "));
+await env.DB.exec(runningGroups.replace(/--[^\n]*/g, "").replace(/\s+/g, " "));

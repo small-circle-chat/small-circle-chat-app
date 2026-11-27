@@ -122,6 +122,9 @@ export async function undoMessageInsert(db: D1Database, conversationId: string, 
              ),
              last_message_sender_id = (
                SELECT sender_id FROM messages WHERE conversation_id = ?1 AND deleted_at IS NULL ORDER BY seq DESC LIMIT 1
+             ),
+             last_message_kind = (
+               SELECT kind FROM messages WHERE conversation_id = ?1 AND deleted_at IS NULL ORDER BY seq DESC LIMIT 1
              )
          WHERE id = ?1`,
       )

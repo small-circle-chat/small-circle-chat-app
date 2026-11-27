@@ -79,6 +79,7 @@ export class UserHub extends DurableObject<Env> {
     const peers = await this.env.DB.prepare(
       `SELECT DISTINCT other.user_id AS user_id
        FROM conversation_members me
+       JOIN conversations c ON c.id = me.conversation_id AND c.type = 'direct'
        JOIN conversation_members other
          ON other.conversation_id = me.conversation_id
         AND other.user_id != me.user_id

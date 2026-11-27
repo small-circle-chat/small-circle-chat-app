@@ -143,6 +143,17 @@ textarea { resize: vertical; min-height: 44px; }
 .account-form { width: 100%; max-width: 440px; margin: 0 auto; }
 .account-form .row { margin-top: 18px; }
 .account-hint { margin: 12px 0 0; line-height: 1.4; }
+.group-row { margin-top: 12px; }
+.group-heading { margin: 18px 0 2px; font-weight: 600; }
+.group-count { margin: 12px 0 0; }
+.member-picker { margin-top: 10px; border: 1px solid var(--line); border-radius: 14px; background: #fff; max-height: 50vh; overflow: auto; }
+.member-option { display: flex; align-items: center; gap: 12px; padding: 10px 14px; cursor: pointer; }
+.member-option + .member-option { border-top: 1px solid var(--line); }
+.member-option input { flex: none; width: 18px; height: 18px; margin: 0; accent-color: var(--accent); }
+.member-who { min-width: 0; }
+.member-who strong, .member-who .meta { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sender-name { margin: 4px 0 -8px 4px; color: var(--muted); font-family: "Avenir Next", "Segoe UI", sans-serif; font-size: 0.78rem; }
+.roster { cursor: default; }
 .account-saved { margin: 12px 0 0; color: var(--accent); font-family: "Avenir Next", "Segoe UI", sans-serif; font-size: 0.9rem; }
 .finder { padding: 12px 16px; border-bottom: 1px solid var(--line); }
 .request-note { margin: 10px 0 0; color: var(--muted); font-family: "Avenir Next", "Segoe UI", sans-serif; font-size: 0.85rem; line-height: 1.35; }
@@ -478,3 +489,18 @@ body:has(.viewer) { overflow: hidden; }
   .preview { max-width: 70vw; }
   .bubble { max-width: min(88%, 520px); }
 }
+
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.system-line { align-self: center; max-width: 85%; text-align: center; color: var(--muted); font-family: "Avenir Next", "Segoe UI", sans-serif; font-size: 0.82rem; line-height: 1.35; }
+.system-line small { display: block; margin-top: 2px; font-size: 0.72rem; opacity: 0.8; }
+.bubble.hidden-message { background: transparent; border-style: dashed; }
+.bubble.hidden-message .deleted-note { color: var(--muted); font-style: italic; }
+.detail-section { margin-top: 22px; }
+.detail-section:first-of-type { margin-top: 0; }
+.detail-section .row { margin-top: 10px; gap: 6px; flex-wrap: wrap; }
+.member-row { cursor: default; flex-wrap: wrap; }
+.member-row .member-who { flex: 1 1 auto; }
+.role-badge { flex: none; padding: 1px 8px; border-radius: 999px; background: #e6f1ec; color: var(--accent); font-family: "Avenir Next", "Segoe UI", sans-serif; font-size: 0.72rem; }
+.member-actions { flex: none; margin-top: 0; gap: 6px; }
+.ghost.small { padding: 4px 10px; font-size: 0.85rem; }
