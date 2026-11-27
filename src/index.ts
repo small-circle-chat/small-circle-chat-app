@@ -1,5 +1,5 @@
 import { Hono, type Context } from "hono";
-import type { ConversationDto, HubEvent } from "../shared/events";
+import type { ConversationDto } from "../shared/events";
 import {
   LOGIN_COOLDOWN_MS,
   LOGIN_TOKEN_TTL_MS,
@@ -9,6 +9,7 @@ import {
   findUserBySession,
   getConversation,
   isBlocked,
+  memberIds,
   listConversations,
   randomToken,
   readCookie,
@@ -332,11 +333,13 @@ app.post("/api/chat-requests", async (c) => {
     return error(c, 429, "rate_limited", "You've sent a lot of chat requests today. Try again tomorrow.");
   }
   if (outcome.kind === "requested") {
-    c.executionCtx.waitUntil(notify(c.env, [outcome.recipientId], { type: "chat_request" }));
+    background(c, "chat_request", fanOut(c.env, [outcome.recipientId], { type: "chat_request" }));
   }
   if (outcome.kind === "opened") {
-    c.executionCtx.waitUntil(
-      notify(c.env, [user.id, outcome.otherId], { type: "conversation_opened", conversationId: outcome.conversationId }),
+    background(
+      c,
+      "conversation_opened",
+      fanOut(c.env, [user.id, outcome.otherId], { type: "conversation_opened", conversationId: outcome.conversationId }),
     );
   }
   // Identical reply in every case: it never says whether the username exists.
@@ -353,7 +356,7 @@ app.post("/api/chat-requests/:requestId/:action", async (c) => {
   const result = await respondToRequest(c.env.DB, user.id, requestId, action);
   if (!result) return error(c, 404, "not_found", "That request is no longer available.");
   if (!result.conversationId) return c.json({ ok: true });
-  await notify(c.env, [user.id, result.senderId], { type: "conversation_opened", conversationId: result.conversationId });
+  background(c, "conversation_opened", fanOut(c.env, [user.id, result.senderId], { type: "conversation_opened", conversationId: result.conversationId }));
   return conversationResponse(c, result.conversationId, 200);
 });
 
@@ -382,7 +385,7 @@ app.post("/api/invite/redeem", async (c) => {
   if (outcome.kind === "invalid") return error(c, 404, "invalid_invite", "This invite link is no longer valid. Ask for a new one.");
   if (outcome.kind === "own") return error(c, 400, "own_invite", "That's your own invite link. Send it to someone you want to chat with.");
   if (outcome.created) {
-    await notify(c.env, [outcome.ownerId], { type: "conversation_opened", conversationId: outcome.conversationId });
+    background(c, "conversation_opened", fanOut(c.env, [outcome.ownerId], { type: "conversation_opened", conversationId: outcome.conversationId }));
   }
   return conversationResponse(c, outcome.conversationId, outcome.created ? 201 : 200);
 });
@@ -527,11 +530,7 @@ app.post("/api/conversations/:id/messages", async (c) => {
     inserted.message.attachments = linked;
   }
   if (!inserted.replay) {
-    try {
-      await publishMessage(c.env, conversation.id, inserted.message);
-    } catch (error) {
-      console.error("message fan-out failed", error);
-    }
+    background(c, "message", publishMessage(c.env, conversation.id, inserted.message));
   }
   return c.json({ message: inserted.message, idempotentReplay: inserted.replay }, inserted.replay ? 200 : 201);
 });
@@ -563,6 +562,8 @@ app.put("/api/conversations/:id/messages/:messageId/reaction", async (c) => {
   });
   if (!result) return error(c, 404, "not_found", "Message not found.");
   if (result.changed) {
+    // Reaction events are changes applied in order, so this one waits: background delivery
+    // could let two quick changes arrive swapped and leave the other person out of sync.
     try {
       await publishReaction(c.env, conversation.id, messageId, user.id, emoji);
     } catch (error) {
@@ -587,11 +588,7 @@ app.delete("/api/conversations/:id/messages/:messageId", async (c) => {
   if (result === "not_found") return error(c, 404, "not_found", "Message not found.");
   if (result === "forbidden") return error(c, 403, "forbidden", "You can only delete your own messages.");
   if (result === "deleted") {
-    try {
-      await publishMessageDeleted(c.env, conversation.id, messageId);
-    } catch (error) {
-      console.error("delete fan-out failed", error);
-    }
+    background(c, "delete", publishMessageDeleted(c.env, conversation.id, messageId));
   }
   return c.json({ ok: true });
 });
@@ -607,16 +604,13 @@ app.post("/api/conversations/:id/read", async (c) => {
 
   const lastReadSeq = await markRead(c.env.DB, conversation.id, user.id, seq);
   if (lastReadSeq === null) return error(c, 404, "not_found", "Conversation not found.");
-  try {
-    await fanOut(c.env, [user.id, conversation.peer.id], {
-      type: "read",
-      conversationId: conversation.id,
-      userId: user.id,
-      lastReadSeq,
-    });
-  } catch (error) {
-    console.error("read fan-out failed", error);
-  }
+  background(
+    c,
+    "read",
+    memberIds(c.env.DB, conversation.id).then((ids) =>
+      fanOut(c.env, ids, { type: "read", conversationId: conversation.id, userId: user.id, lastReadSeq }),
+    ),
+  );
   return c.json({ lastReadSeq });
 });
 
@@ -750,12 +744,13 @@ async function conversationResponse(c: AppContext, conversationId: string, statu
   return c.json({ conversation: withPeer }, status);
 }
 
-async function notify(env: Env, userIds: string[], event: HubEvent): Promise<void> {
-  try {
-    await fanOut(env, userIds, event);
-  } catch (error) {
-    console.error("fan-out failed", event.type, error);
-  }
+/** Live delivery runs after the response is sent, so a slow hub never holds up the sender. */
+function background(c: AppContext, label: string, work: Promise<unknown>): void {
+  c.executionCtx.waitUntil(
+    work.catch((error) => {
+      console.error(`${label} fan-out failed`, error);
+    }),
+  );
 }
 
 async function requireConversation(c: AppContext) {

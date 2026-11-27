@@ -41,8 +41,21 @@ export type MessagePage = {
   hasMore: boolean;
 };
 
+export type MemberDto = {
+  id: string;
+  username: string;
+  displayName: string;
+  deleted: boolean;
+  role: string;
+  lastReadSeq: number;
+};
+
 export type ConversationDto = {
   id: string;
+  type: "direct" | "group";
+  title: string | null;
+  /** Everyone in the conversation, including you. `peer` stays for one-to-one chats. */
+  members: MemberDto[];
   unreadCount: number;
   lastReadSeq: number;
   peerLastReadSeq: number;
