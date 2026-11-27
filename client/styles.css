@@ -223,6 +223,23 @@ textarea { resize: vertical; min-height: 44px; }
 }
 .copy-message svg { display: block; width: 18px; height: 18px; }
 .copy-message.copied { color: var(--accent); }
+.delete-message {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 44px;
+  height: 46px;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--danger);
+  box-shadow: 0 6px 18px rgba(28, 25, 21, 0.14);
+}
+.delete-message svg { display: block; width: 18px; height: 18px; }
+.bubble.deleted { background: transparent; border-style: dashed; }
+.bubble.deleted .deleted-note { color: var(--muted); font-style: italic; }
 .reaction-row { display: flex; align-items: center; gap: 4px; }
 .reaction-row[hidden] { display: none; }
 .chip, .react-bar button {

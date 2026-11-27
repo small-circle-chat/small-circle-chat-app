@@ -23,6 +23,7 @@ export type MessageRow = {
   seq: number;
   body: string;
   created_at: number;
+  deleted_at: number | null;
 };
 
 export type LoginTokenRow = {
@@ -59,8 +60,9 @@ export function toMessage(
     seq: row.seq,
     body: row.body,
     createdAt: row.created_at,
-    attachments,
-    reactions,
+    deletedAt: row.deleted_at ?? null,
+    attachments: row.deleted_at ? [] : attachments,
+    reactions: row.deleted_at ? [] : reactions,
   };
 }
 

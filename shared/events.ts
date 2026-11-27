@@ -31,6 +31,7 @@ export type MessageDto = {
   seq: number;
   body: string;
   createdAt: number;
+  deletedAt: number | null;
   attachments: AttachmentDto[];
   reactions: ReactionGroup[];
 };
@@ -57,7 +58,8 @@ export type HubEvent =
   | { type: "read"; conversationId: string; userId: string; lastReadSeq: number }
   | { type: "typing"; conversationId: string; userId: string; active: boolean }
   | { type: "presence"; userId: string; online: boolean }
-  | { type: "reaction"; conversationId: string; messageId: string; userId: string; emoji: string | null };
+  | { type: "reaction"; conversationId: string; messageId: string; userId: string; emoji: string | null }
+  | { type: "message_deleted"; conversationId: string; messageId: string };
 
 export type ApiError = {
   error: {
