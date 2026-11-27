@@ -77,6 +77,10 @@
       }
     }
   ],
+  "triggers": {
+    // Weekly, Mondays 04:00 UTC: delete uploaded images that never got sent.
+    "crons": ["0 4 * * 1"]
+  },
   "vars": {
     "MAIL_FROM": "noreply@smallcirclechat.app",
     "MAIL_FROM_NAME": "Small Circle Chat"

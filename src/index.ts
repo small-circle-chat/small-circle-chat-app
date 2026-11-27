@@ -28,6 +28,7 @@ import {
   sniffImage,
   undoMessageInsert,
 } from "./attachments";
+import { cleanupAbandonedAttachments } from "./cleanup";
 import { deliverMagicLink, MailDeliveryError } from "./mail";
 import { deleteMessage, insertMessage, listMessages, markRead, publishMessage, publishMessageDeleted } from "./messages";
 import { publishReaction, setMessageReaction } from "./reactions";
@@ -625,7 +626,16 @@ app.notFound((c) => {
   return c.text("Not found", 404);
 });
 
-export default app;
+export default {
+  fetch: app.fetch,
+  async scheduled(_controller, env, ctx) {
+    ctx.waitUntil(
+      cleanupAbandonedAttachments(env).then((removed) => {
+        console.log(`abandoned attachment cleanup removed ${removed} image(s)`);
+      }),
+    );
+  },
+} satisfies ExportedHandler<Env>;
 export { UserHub };
 
 function isPublicAuth(path: string): boolean {
