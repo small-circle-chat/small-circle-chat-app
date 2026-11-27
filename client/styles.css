@@ -179,7 +179,8 @@ textarea { resize: vertical; min-height: 44px; }
   display: flex;
   flex-direction: column;
 }
-.messages { padding: 18px 18px 28px; display: flex; flex-direction: column; gap: 14px; }
+.messages { padding: 18px 18px 28px; display: flex; flex-direction: column; gap: 14px; overflow-anchor: none; }
+.messages > .older { align-self: center; flex: none; }
 .bubble {
   position: relative;
   max-width: min(70%, 520px);
@@ -396,7 +397,7 @@ body:has(.viewer) { overflow: hidden; }
 .presence { color: var(--accent); font-family: "Avenir Next", "Segoe UI", sans-serif; font-size: 0.85rem; }
 .typing {
   position: absolute;
-  z-index: 1;
+  z-index: 2;
   left: 18px;
   bottom: 8px;
   max-width: calc(100% - 36px);
@@ -415,6 +416,40 @@ body:has(.viewer) { overflow: hidden; }
   text-overflow: ellipsis;
 }
 .typing:empty { display: none; }
+.transcript-fade {
+  position: absolute;
+  z-index: 1;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 56px;
+  background: linear-gradient(to bottom, rgba(247, 244, 239, 0), var(--paper) 85%);
+  pointer-events: none;
+}
+.new-messages {
+  position: absolute;
+  z-index: 2;
+  right: 18px;
+  bottom: 8px;
+  max-width: calc(100% - 36px);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  color: var(--accent);
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+  font-size: 0.85rem;
+  line-height: 1.2rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.new-messages .arrow { font-size: 0.8rem; }
+.transcript-fade[hidden], .new-messages[hidden] { display: none; }
 .dev-link { word-break: break-all; }
 
 @media (max-width: 760px) {
