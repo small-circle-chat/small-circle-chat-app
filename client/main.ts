@@ -24,6 +24,8 @@ let mode: "login" | "register" = "login";
 let accountOpen = false;
 let accountError = "";
 let accountDraft: { username: string; displayName: string } | null = null;
+let accountSaved = false;
+const ACCOUNT_PATH = "/account";
 let devLink = "";
 let draftText = "";
 let drafts: Array<{ file: File; url: string }> = [];
@@ -60,6 +62,7 @@ const root = app;
 
 bindVisualViewport();
 bindReactionDismiss();
+bindRoutes();
 void boot();
 
 function bindVisualViewport(): void {
@@ -231,6 +234,7 @@ async function verify(token: string): Promise<void> {
 }
 
 async function showApp(): Promise<void> {
+  accountOpen = location.pathname === ACCOUNT_PATH;
   renderShell();
   connect();
   document.addEventListener("visibilitychange", () => {
@@ -362,7 +366,7 @@ function renderInviteRow(): HTMLElement {
 function renderShell(): void {
   root.innerHTML = "";
   const shell = el("div", "shell");
-  if (activeId) shell.classList.add("thread-open");
+  if (activeId || accountOpen) shell.classList.add("thread-open");
   const sidebar = el("aside", "sidebar");
   const head = el("div", "sidebar-head");
   const logout = el("button", "ghost", "Log out") as HTMLButtonElement;
@@ -375,6 +379,7 @@ function renderShell(): void {
     requestNote = null;
     accountOpen = false;
     accountDraft = null;
+    if (location.pathname === ACCOUNT_PATH) history.replaceState(null, "", "/");
     closeViewer();
     socket?.close();
     banner = "";
@@ -384,10 +389,8 @@ function renderShell(): void {
   account.type = "button";
   account.setAttribute("aria-pressed", accountOpen ? "true" : "false");
   account.addEventListener("click", () => {
-    accountOpen = !accountOpen;
-    accountError = "";
-    accountDraft = null;
-    renderShell();
+    if (accountOpen) closeAccount();
+    else openAccount();
   });
   const actions = el("div", "row");
   actions.append(account, logout);
@@ -395,7 +398,6 @@ function renderShell(): void {
   identity.append(el("h2", "", me?.displayName ?? "Messages"));
   identity.append(el("div", "meta", me ? `@${me.username}` : ""));
   head.append(identity, actions);
-  const accountForm = accountOpen ? renderAccountForm() : null;
   const finder = document.createElement("form");
   finder.className = "finder";
   const username = field("Send a chat request", "text", "username");
@@ -426,7 +428,7 @@ function renderShell(): void {
   finder.append(renderInviteRow());
   const list = el("div", "conversation-list");
   list.id = "conversation-list";
-  sidebar.append(head, ...(accountForm ? [accountForm] : []), finder, list);
+  sidebar.append(head, finder, list);
   const thread = el("section", "thread");
   thread.id = "thread";
   shell.append(sidebar, thread);
@@ -435,30 +437,85 @@ function renderShell(): void {
   paintThread();
 }
 
-function renderAccountForm(): HTMLFormElement {
+function openAccount(): void {
+  if (location.pathname !== ACCOUNT_PATH) history.pushState({ view: "account" }, "", ACCOUNT_PATH);
+  showAccount();
+}
+
+function showAccount(): void {
+  accountOpen = true;
+  accountError = "";
+  accountDraft = null;
+  accountSaved = false;
+  activeId = null;
+  openReactionId = null;
+  closeViewer();
+  renderShell();
+}
+
+function closeAccount(): void {
+  // Opened from inside the app: step back so the browser's Back button stays in sync.
+  if (history.state?.view === "account") {
+    history.back();
+    return;
+  }
+  if (location.pathname === ACCOUNT_PATH) history.replaceState(null, "", "/");
+  hideAccount();
+}
+
+function hideAccount(): void {
+  if (!accountOpen) return;
+  accountOpen = false;
+  accountError = "";
+  accountDraft = null;
+  accountSaved = false;
+  renderShell();
+}
+
+function bindRoutes(): void {
+  window.addEventListener("popstate", () => {
+    if (!me) return;
+    if (location.pathname === ACCOUNT_PATH) showAccount();
+    else hideAccount();
+  });
+}
+
+function renderAccountPage(thread: Element): void {
+  thread.setAttribute("data-view", "account");
+  thread.removeAttribute("data-conversation-id");
+  const head = el("div", "thread-head");
+  const back = el("button", "ghost", "Back") as HTMLButtonElement;
+  back.type = "button";
+  back.addEventListener("click", () => closeAccount());
+  const title = el("div");
+  title.append(el("h2", "", "Account"));
+  title.append(el("div", "presence", me ? `@${me.username}` : ""));
+  head.append(back, title, el("span", "head-spacer"));
+
+  const page = el("div", "account-page");
   const form = document.createElement("form");
-  form.className = "account";
+  form.className = "account-form";
   const username = field("Username", "text", "ada");
   const displayName = field("Display name", "text", "Ada Lovelace");
   username.input.value = accountDraft?.username ?? me?.username ?? "";
   displayName.input.value = accountDraft?.displayName ?? me?.displayName ?? "";
   username.input.autocomplete = "username";
+  username.input.autocapitalize = "none";
+  username.input.spellcheck = false;
   displayName.input.autocomplete = "name";
+  const hint = el("p", "meta account-hint", "People can send you a chat request with your username. Your display name is what they see.");
   const error = el("p", "banner", accountError);
   error.hidden = accountError.length === 0;
+  const saved = el("p", "account-saved", "Saved.");
+  saved.hidden = !accountSaved;
   const save = el("button", "primary", "Save") as HTMLButtonElement;
   save.type = "submit";
-  const cancel = el("button", "ghost", "Cancel") as HTMLButtonElement;
-  cancel.type = "button";
-  cancel.addEventListener("click", () => {
-    accountOpen = false;
-    accountError = "";
-    accountDraft = null;
-    renderShell();
-  });
   const actions = el("div", "row");
-  actions.append(save, cancel);
-  form.append(username.label, displayName.label, error, actions);
+  actions.append(save);
+  form.append(username.label, displayName.label, hint, error, saved, actions);
+  form.addEventListener("input", () => {
+    saved.hidden = true;
+  });
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     save.disabled = true;
@@ -470,16 +527,18 @@ function renderAccountForm(): HTMLFormElement {
     if (!result.ok) {
       accountDraft = { username: username.input.value, displayName: displayName.input.value };
       accountError = result.message;
+      accountSaved = false;
       renderShell();
       return;
     }
     me = result.data.user;
-    accountOpen = false;
     accountError = "";
     accountDraft = null;
+    accountSaved = true;
     renderShell();
   });
-  return form;
+  page.append(form);
+  thread.replaceChildren(head, page);
 }
 
 function paintList(): void {
@@ -544,6 +603,15 @@ function paintTitle(): void {
 function paintThread(): void {
   const thread = document.querySelector("#thread");
   if (!thread) return;
+  if (accountOpen) {
+    // Live updates repaint the thread often; leave the account page (and anything typed) alone.
+    if (thread.getAttribute("data-view") !== "account") renderAccountPage(thread);
+    return;
+  }
+  if (thread.getAttribute("data-view") === "account") {
+    thread.removeAttribute("data-view");
+    thread.replaceChildren();
+  }
   const caret = captureComposerCaret();
   const conversation = conversations.find((item) => item.id === activeId);
   if (!conversation) {
@@ -799,6 +867,11 @@ async function refresh(): Promise<void> {
 }
 
 async function openConversation(id: string): Promise<void> {
+  if (accountOpen) {
+    accountOpen = false;
+    if (location.pathname === ACCOUNT_PATH) history.replaceState(null, "", "/");
+    renderShell();
+  }
   activeId = id;
   unseenCount = 0;
   openReactionId = null;
