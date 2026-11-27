@@ -1,4 +1,4 @@
-import type { ApiError, ConversationDto, HubEvent, MessageDto, MessagePage, PublicUser, ReactionGroup } from "../shared/events";
+import type { ApiError, ChatRequestDto, ConversationDto, HubEvent, MessageDto, MessagePage, PublicUser, ReactionGroup } from "../shared/events";
 
 const APP_TITLE = "Small Circle Chat";
 
@@ -24,12 +24,20 @@ let mode: "login" | "register" = "login";
 let accountOpen = false;
 let accountError = "";
 let accountDraft: { username: string; displayName: string } | null = null;
+let accountSaved = false;
+const ACCOUNT_PATH = "/account";
 let devLink = "";
 let draftText = "";
 let drafts: Array<{ file: File; url: string }> = [];
 let viewerSrc: string | null = null;
 let openReactionId: string | null = null;
 let copiedMessageId: string | null = null;
+let chatRequests: ChatRequestDto[] = [];
+let inviteToken: string | null = null;
+let inviteCopied = false;
+let requestNote: { text: string; error: boolean } | null = null;
+const PENDING_INVITE_KEY = "pendingInvite";
+const INVITE_PATH = /^\/invite\/([A-Za-z0-9_-]{43})\/?$/;
 // Where the open thread is scrolled. "Pinned" means following the newest message;
 // otherwise the anchor is the first visible message and its offset from the top.
 let threadPinned = true;
@@ -54,6 +62,7 @@ const root = app;
 
 bindVisualViewport();
 bindReactionDismiss();
+bindRoutes();
 void boot();
 
 function bindVisualViewport(): void {
@@ -110,6 +119,12 @@ function measureViewportUnit(height: string): number {
 }
 
 async function boot(): Promise<void> {
+  const invite = INVITE_PATH.exec(location.pathname)?.[1];
+  if (invite) {
+    // Kept until after sign-in, which may finish in another tab via the email link.
+    storePendingInvite(invite);
+    history.replaceState(null, "", "/");
+  }
   const params = new URLSearchParams(location.search);
   const token = params.get("token");
   if (location.pathname === "/auth/verify" && token) {
@@ -133,6 +148,9 @@ function renderAuth(): void {
   const card = el("section", "card");
   card.append(el("h1", "", APP_TITLE));
   card.append(el("p", "lede", "Sign in with a link sent to your email. No password."));
+  if (readPendingInvite()) {
+    card.append(el("p", "invite-note", "Sign in or create an account to accept your chat invite."));
+  }
   const tabs = el("div", "tabs");
   tabs.append(
     tabButton("Sign in", mode === "login", () => { mode = "login"; renderAuth(); }),
@@ -216,18 +234,139 @@ async function verify(token: string): Promise<void> {
 }
 
 async function showApp(): Promise<void> {
+  accountOpen = location.pathname === ACCOUNT_PATH;
   renderShell();
   connect();
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") void refresh();
   });
   await refresh();
+  await loadRequests();
+  await redeemPendingInvite();
+}
+
+function storePendingInvite(token: string): void {
+  try {
+    localStorage.setItem(PENDING_INVITE_KEY, token);
+  } catch {
+    // Without storage the invite simply has to be opened again after signing in.
+  }
+}
+
+function readPendingInvite(): string | null {
+  try {
+    return localStorage.getItem(PENDING_INVITE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function clearPendingInvite(): void {
+  try {
+    localStorage.removeItem(PENDING_INVITE_KEY);
+  } catch {
+    // Nothing to clear.
+  }
+}
+
+async function redeemPendingInvite(): Promise<void> {
+  const token = readPendingInvite();
+  if (!token) return;
+  clearPendingInvite();
+  const result = await api<{ conversation: ConversationDto }>("/api/invite/redeem", { method: "POST", body: { token } });
+  if (!result.ok) {
+    setRequestNote(result.message, true);
+    return;
+  }
+  upsertConversation(result.data.conversation);
+  await openConversation(result.data.conversation.id);
+}
+
+async function loadRequests(): Promise<void> {
+  const result = await api<{ requests: ChatRequestDto[] }>("/api/chat-requests");
+  if (!result.ok) return;
+  chatRequests = result.data.requests;
+  paintList();
+}
+
+async function respondToRequest(request: ChatRequestDto, action: "accept" | "decline" | "block"): Promise<void> {
+  if (action === "block" && !window.confirm(`Block ${request.from.displayName}? They won't be able to send you requests.`)) return;
+  const result = await api<{ conversation?: ConversationDto }>(`/api/chat-requests/${request.id}/${action}`, { method: "POST" });
+  chatRequests = chatRequests.filter((item) => item.id !== request.id);
+  paintList();
+  if (!result.ok) {
+    setRequestNote(result.message, true);
+    return;
+  }
+  if (result.data.conversation) {
+    upsertConversation(result.data.conversation);
+    await openConversation(result.data.conversation.id);
+  }
+}
+
+function setRequestNote(text: string, error = false): void {
+  requestNote = { text, error };
+  const node = document.querySelector<HTMLElement>(".request-note");
+  if (!node) return;
+  node.hidden = false;
+  node.textContent = text;
+  node.classList.toggle("error", error);
+}
+
+function inviteUrl(token: string): string {
+  return `${location.origin}/invite/${token}`;
+}
+
+async function ensureInviteToken(): Promise<string | null> {
+  if (inviteToken) return inviteToken;
+  const result = await api<{ token: string }>("/api/invite");
+  if (!result.ok) return null;
+  inviteToken = result.data.token;
+  return inviteToken;
+}
+
+function renderInviteRow(): HTMLElement {
+  const row = el("div", "invite-row");
+  const label = el("div", "invite-label");
+  label.append(el("strong", "", "Your invite link"));
+  label.append(el("span", "meta", "Anyone with it can start a chat with you."));
+  const copy = el("button", "ghost", inviteCopied ? "Copied" : "Copy link") as HTMLButtonElement;
+  copy.type = "button";
+  copy.addEventListener("click", async () => {
+    const token = await ensureInviteToken();
+    if (!token || !(await writeClipboard(inviteUrl(token)))) {
+      setRequestNote("The invite link could not be copied.", true);
+      return;
+    }
+    inviteCopied = true;
+    copy.textContent = "Copied";
+    window.setTimeout(() => {
+      inviteCopied = false;
+      if (copy.isConnected) copy.textContent = "Copy link";
+    }, 2000);
+  });
+  const reset = el("button", "ghost", "Reset") as HTMLButtonElement;
+  reset.type = "button";
+  reset.addEventListener("click", async () => {
+    if (!window.confirm("Reset your invite link? Anyone with the old link won't be able to use it.")) return;
+    const result = await api<{ token: string }>("/api/invite/reset", { method: "POST" });
+    if (!result.ok) {
+      setRequestNote(result.message, true);
+      return;
+    }
+    inviteToken = result.data.token;
+    setRequestNote("Your invite link was reset. Copy the new one to share it.");
+  });
+  const actions = el("div", "row");
+  actions.append(copy, reset);
+  row.append(label, actions);
+  return row;
 }
 
 function renderShell(): void {
   root.innerHTML = "";
   const shell = el("div", "shell");
-  if (activeId) shell.classList.add("thread-open");
+  if (activeId || accountOpen) shell.classList.add("thread-open");
   const sidebar = el("aside", "sidebar");
   const head = el("div", "sidebar-head");
   const logout = el("button", "ghost", "Log out") as HTMLButtonElement;
@@ -235,8 +374,12 @@ function renderShell(): void {
   logout.addEventListener("click", async () => {
     await api("/api/auth/logout", { method: "POST", body: {} });
     me = null;
+    chatRequests = [];
+    inviteToken = null;
+    requestNote = null;
     accountOpen = false;
     accountDraft = null;
+    if (location.pathname === ACCOUNT_PATH) history.replaceState(null, "", "/");
     closeViewer();
     socket?.close();
     banner = "";
@@ -246,10 +389,8 @@ function renderShell(): void {
   account.type = "button";
   account.setAttribute("aria-pressed", accountOpen ? "true" : "false");
   account.addEventListener("click", () => {
-    accountOpen = !accountOpen;
-    accountError = "";
-    accountDraft = null;
-    renderShell();
+    if (accountOpen) closeAccount();
+    else openAccount();
   });
   const actions = el("div", "row");
   actions.append(account, logout);
@@ -257,37 +398,37 @@ function renderShell(): void {
   identity.append(el("h2", "", me?.displayName ?? "Messages"));
   identity.append(el("div", "meta", me ? `@${me.username}` : ""));
   head.append(identity, actions);
-  const accountForm = accountOpen ? renderAccountForm() : null;
   const finder = document.createElement("form");
   finder.className = "finder";
-  const username = field("Start a conversation", "text", "username");
-  const start = el("button", "primary", "Open") as HTMLButtonElement;
+  const username = field("Send a chat request", "text", "username");
+  username.input.autocomplete = "off";
+  username.input.autocapitalize = "none";
+  username.input.spellcheck = false;
+  const start = el("button", "primary", "Send") as HTMLButtonElement;
   start.type = "submit";
-  finder.append(username.label, start);
-  const findError = el("p", "banner");
-  findError.hidden = true;
-  finder.append(findError);
+  const note = el("p", requestNote?.error ? "request-note error" : "request-note", requestNote?.text ?? "");
+  note.hidden = !requestNote;
+  finder.append(username.label, start, note);
   finder.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (!username.input.value.trim()) return;
     start.disabled = true;
-    const result = await api<{ conversation: ConversationDto }>("/api/conversations", {
+    const result = await api<{ message: string }>("/api/chat-requests", {
       method: "POST",
       body: { username: username.input.value },
     });
     start.disabled = false;
     if (!result.ok) {
-      findError.hidden = false;
-      findError.textContent = result.message;
+      setRequestNote(result.message, true);
       return;
     }
-    findError.hidden = true;
     username.input.value = "";
-    upsertConversation(result.data.conversation);
-    await openConversation(result.data.conversation.id);
+    setRequestNote(result.data.message);
   });
+  finder.append(renderInviteRow());
   const list = el("div", "conversation-list");
   list.id = "conversation-list";
-  sidebar.append(head, ...(accountForm ? [accountForm] : []), finder, list);
+  sidebar.append(head, finder, list);
   const thread = el("section", "thread");
   thread.id = "thread";
   shell.append(sidebar, thread);
@@ -296,30 +437,85 @@ function renderShell(): void {
   paintThread();
 }
 
-function renderAccountForm(): HTMLFormElement {
+function openAccount(): void {
+  if (location.pathname !== ACCOUNT_PATH) history.pushState({ view: "account" }, "", ACCOUNT_PATH);
+  showAccount();
+}
+
+function showAccount(): void {
+  accountOpen = true;
+  accountError = "";
+  accountDraft = null;
+  accountSaved = false;
+  activeId = null;
+  openReactionId = null;
+  closeViewer();
+  renderShell();
+}
+
+function closeAccount(): void {
+  // Opened from inside the app: step back so the browser's Back button stays in sync.
+  if (history.state?.view === "account") {
+    history.back();
+    return;
+  }
+  if (location.pathname === ACCOUNT_PATH) history.replaceState(null, "", "/");
+  hideAccount();
+}
+
+function hideAccount(): void {
+  if (!accountOpen) return;
+  accountOpen = false;
+  accountError = "";
+  accountDraft = null;
+  accountSaved = false;
+  renderShell();
+}
+
+function bindRoutes(): void {
+  window.addEventListener("popstate", () => {
+    if (!me) return;
+    if (location.pathname === ACCOUNT_PATH) showAccount();
+    else hideAccount();
+  });
+}
+
+function renderAccountPage(thread: Element): void {
+  thread.setAttribute("data-view", "account");
+  thread.removeAttribute("data-conversation-id");
+  const head = el("div", "thread-head");
+  const back = el("button", "ghost", "Back") as HTMLButtonElement;
+  back.type = "button";
+  back.addEventListener("click", () => closeAccount());
+  const title = el("div");
+  title.append(el("h2", "", "Account"));
+  title.append(el("div", "presence", me ? `@${me.username}` : ""));
+  head.append(back, title, el("span", "head-spacer"));
+
+  const page = el("div", "account-page");
   const form = document.createElement("form");
-  form.className = "account";
+  form.className = "account-form";
   const username = field("Username", "text", "ada");
   const displayName = field("Display name", "text", "Ada Lovelace");
   username.input.value = accountDraft?.username ?? me?.username ?? "";
   displayName.input.value = accountDraft?.displayName ?? me?.displayName ?? "";
   username.input.autocomplete = "username";
+  username.input.autocapitalize = "none";
+  username.input.spellcheck = false;
   displayName.input.autocomplete = "name";
+  const hint = el("p", "meta account-hint", "People can send you a chat request with your username. Your display name is what they see.");
   const error = el("p", "banner", accountError);
   error.hidden = accountError.length === 0;
+  const saved = el("p", "account-saved", "Saved.");
+  saved.hidden = !accountSaved;
   const save = el("button", "primary", "Save") as HTMLButtonElement;
   save.type = "submit";
-  const cancel = el("button", "ghost", "Cancel") as HTMLButtonElement;
-  cancel.type = "button";
-  cancel.addEventListener("click", () => {
-    accountOpen = false;
-    accountError = "";
-    accountDraft = null;
-    renderShell();
-  });
   const actions = el("div", "row");
-  actions.append(save, cancel);
-  form.append(username.label, displayName.label, error, actions);
+  actions.append(save);
+  form.append(username.label, displayName.label, hint, error, saved, actions);
+  form.addEventListener("input", () => {
+    saved.hidden = true;
+  });
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     save.disabled = true;
@@ -331,16 +527,18 @@ function renderAccountForm(): HTMLFormElement {
     if (!result.ok) {
       accountDraft = { username: username.input.value, displayName: displayName.input.value };
       accountError = result.message;
+      accountSaved = false;
       renderShell();
       return;
     }
     me = result.data.user;
-    accountOpen = false;
     accountError = "";
     accountDraft = null;
+    accountSaved = true;
     renderShell();
   });
-  return form;
+  page.append(form);
+  thread.replaceChildren(head, page);
 }
 
 function paintList(): void {
@@ -350,8 +548,11 @@ function paintList(): void {
   const caret = captureComposerCaret();
   try {
     list.replaceChildren();
+    if (chatRequests.length > 0) list.append(renderRequests());
     if (conversations.length === 0) {
-      list.append(el("p", "empty", "Find someone by their exact username."));
+      if (chatRequests.length === 0) {
+        list.append(el("p", "empty", "No chats yet. Share your invite link, or send a chat request to someone's username."));
+      }
       return;
     }
     for (const conversation of conversations) {
@@ -372,14 +573,45 @@ function paintList(): void {
   }
 }
 
+function renderRequests(): HTMLElement {
+  const section = el("section", "requests");
+  section.append(el("h3", "", chatRequests.length === 1 ? "1 chat request" : `${chatRequests.length} chat requests`));
+  for (const request of chatRequests) {
+    const item = el("div", "request");
+    const who = el("div", "request-who");
+    who.append(el("strong", "", request.from.displayName), el("span", "meta", `@${request.from.username}`));
+    const actions = el("div", "row");
+    const accept = el("button", "primary", "Accept") as HTMLButtonElement;
+    const decline = el("button", "ghost", "Decline") as HTMLButtonElement;
+    const block = el("button", "ghost danger", "Block") as HTMLButtonElement;
+    for (const [button, action] of [[accept, "accept"], [decline, "decline"], [block, "block"]] as const) {
+      button.type = "button";
+      button.addEventListener("click", () => void respondToRequest(request, action));
+    }
+    actions.append(accept, decline, block);
+    item.append(who, actions);
+    section.append(item);
+  }
+  return section;
+}
+
 function paintTitle(): void {
-  const unread = conversations.reduce((total, conversation) => total + conversation.unreadCount, 0);
+  const unread = conversations.reduce((total, conversation) => total + conversation.unreadCount, 0) + chatRequests.length;
   document.title = unread > 0 ? `(${unread}) ${APP_TITLE}` : APP_TITLE;
 }
 
 function paintThread(): void {
   const thread = document.querySelector("#thread");
   if (!thread) return;
+  if (accountOpen) {
+    // Live updates repaint the thread often; leave the account page (and anything typed) alone.
+    if (thread.getAttribute("data-view") !== "account") renderAccountPage(thread);
+    return;
+  }
+  if (thread.getAttribute("data-view") === "account") {
+    thread.removeAttribute("data-view");
+    thread.replaceChildren();
+  }
   const caret = captureComposerCaret();
   const conversation = conversations.find((item) => item.id === activeId);
   if (!conversation) {
@@ -635,6 +867,11 @@ async function refresh(): Promise<void> {
 }
 
 async function openConversation(id: string): Promise<void> {
+  if (accountOpen) {
+    accountOpen = false;
+    if (location.pathname === ACCOUNT_PATH) history.replaceState(null, "", "/");
+    renderShell();
+  }
   activeId = id;
   unseenCount = 0;
   openReactionId = null;
@@ -1325,6 +1562,15 @@ function handleEvent(event: HubEvent): void {
   }
   if (event.type === "reaction" && event.conversationId === activeId) {
     applyReactionEvent(event.messageId, event.userId, event.emoji);
+    return;
+  }
+  if (event.type === "chat_request") {
+    void loadRequests();
+    return;
+  }
+  if (event.type === "conversation_opened") {
+    void refresh();
+    void loadRequests();
     return;
   }
   if (event.type === "message_deleted") {

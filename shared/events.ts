@@ -53,13 +53,21 @@ export type ConversationDto = {
   peerOnline: boolean;
 };
 
+export type ChatRequestDto = {
+  id: string;
+  createdAt: number;
+  from: { username: string; displayName: string };
+};
+
 export type HubEvent =
   | { type: "message"; conversationId: string; message: MessageDto }
   | { type: "read"; conversationId: string; userId: string; lastReadSeq: number }
   | { type: "typing"; conversationId: string; userId: string; active: boolean }
   | { type: "presence"; userId: string; online: boolean }
   | { type: "reaction"; conversationId: string; messageId: string; userId: string; emoji: string | null }
-  | { type: "message_deleted"; conversationId: string; messageId: string };
+  | { type: "message_deleted"; conversationId: string; messageId: string }
+  | { type: "chat_request" }
+  | { type: "conversation_opened"; conversationId: string };
 
 export type ApiError = {
   error: {

@@ -1,6 +1,7 @@
 /// <reference types="@cloudflare/vitest-pool-workers" />
 import { createExecutionContext, createScheduledController, env, SELF, waitOnExecutionContext } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { openDirectResponse } from "./open-direct";
 import worker from "../src/index";
 
 const origin = "http://localhost";
@@ -66,7 +67,7 @@ async function upload(cookie: string, conversationId: string, bytes: Uint8Array,
 }
 
 async function openDirect(cookie: string, username: string): Promise<string> {
-  const opened = await send(cookie, "/api/conversations", { username });
+  const opened = await openDirectResponse(cookie, username);
   expect(opened.status).toBe(201);
   return ((await opened.json()) as { conversation: { id: string } }).conversation.id;
 }
